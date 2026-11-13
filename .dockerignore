@@ -16,3 +16,8 @@ secrets/
 **/secrets/**
 data
 backups
+config/*.yaml
+config/**/*.yaml
+config/*.yml
+config/**/*.yml
+!config/config.example.yaml

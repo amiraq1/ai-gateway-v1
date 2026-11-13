@@ -30,12 +30,12 @@ def secret_directory(monkeypatch):
 @pytest.fixture
 def gateway(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_PEPPER", "test-pepper-that-is-at-least-32-bytes-long")
-    monkeypatch.setenv("TEST_PRIMARY_KEY", "provider-secret-primary")
-    monkeypatch.setenv("TEST_SECONDARY_KEY", "provider-secret-secondary")
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY", "provider-secret-primary")
+    monkeypatch.setenv("TEST_SECONDARY_API_KEY", "provider-secret-secondary")
     settings = GatewaySettings("127.0.0.1", 8000, str(tmp_path / "gateway.sqlite3"), 3.0, 1_048_576, 30)
     providers = (
-        ProviderConfig("primary", "test-primary-model", "https://primary.example/v1", "TEST_PRIMARY_KEY", True),
-        ProviderConfig("secondary", "test-secondary-model", "https://secondary.example/v1", "TEST_SECONDARY_KEY", True),
+        ProviderConfig("primary", "test-primary-model", "https://primary.example/v1", "TEST_PRIMARY_API_KEY", True),
+        ProviderConfig("secondary", "test-secondary-model", "https://secondary.example/v1", "TEST_SECONDARY_API_KEY", True),
     )
     cfg = GatewayConfig(settings, {"fast": ModelConfig("fast", True, providers)})
     db = Database(settings.database_path)

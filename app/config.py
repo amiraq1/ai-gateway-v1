@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,20 @@ import yaml
 from .secret_loader import secret_source_configured
 
 
+_PROVIDER_API_KEY_ENV = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_API_KEY\Z")
+_RESERVED_PROVIDER_KEY_PREFIXES = (
+    "ADMIN_", "APP_", "AUTH_", "CLIENT_", "DATABASE_", "DB_", "GATEWAY_",
+    "INTERNAL_", "JWT_", "SECRET_", "SESSION_",
+)
+
+
+def _validate_provider_api_key_env(value: str) -> str:
+    if (not _PROVIDER_API_KEY_ENV.fullmatch(value)
+            or value.startswith(_RESERVED_PROVIDER_KEY_PREFIXES)):
+        raise ValueError("Provider api_key_env must name a provider key ending in _API_KEY")
+    return value
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     name: str
@@ -18,6 +33,9 @@ class ProviderConfig:
     api_base: str
     api_key_env: str
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        _validate_provider_api_key_env(self.api_key_env)
 
 
 @dataclass(frozen=True)
@@ -98,8 +116,9 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
             name = str(item.get("name", "")).strip()
             model_id = str(item.get("model", "")).strip()
             key_env = str(item.get("api_key_env", "")).strip()
-            if not name or not model_id or not key_env or not key_env.replace("_", "").isalnum():
+            if not name or not model_id or not key_env:
                 raise ValueError(f"Provider for {alias!r} requires name, model, and api_key_env")
+            _validate_provider_api_key_env(key_env)
             api_base = _validate_api_base(str(item.get("api_base", "")), name)
             providers.append(ProviderConfig(name, model_id, api_base, key_env, bool(item.get("enabled", True))))
         models[alias] = ModelConfig(alias, bool(entry.get("enabled", True)), tuple(providers))

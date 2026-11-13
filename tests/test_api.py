@@ -52,6 +52,27 @@ def test_invalid_and_revoked_client_keys_return_401(gateway):
         assert revoked.status_code == 401
 
 
+def test_wrong_secret_for_registered_client_returns_401_without_upstream_request(gateway):
+    app, db = gateway
+    upstream_requests = []
+    app.state.http_transport = httpx.MockTransport(
+        lambda request: (upstream_requests.append(request) or success_handler(request))
+    )
+    registered_key = key(db)
+    client_id = db.list_clients()[0]["client_id"]
+    forged_key = f"gw_{client_id}.synthetic-forged-wrong-secret"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {forged_key}"}, json={
+            "model": "fast", "messages": [{"role": "user", "content": "synthetic prompt"}],
+        })
+
+    assert registered_key.startswith(f"gw_{client_id}.")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_api_key"
+    assert upstream_requests == []
+
+
 def test_validation_error_does_not_echo_input_content(gateway):
     app, db = gateway
     token = key(db)

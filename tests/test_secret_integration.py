@@ -34,8 +34,8 @@ def test_streaming_and_non_streaming_load_same_file_secret(streaming, gateway, m
     app, db = gateway
     upstream_secret = "synthetic-provider-secret-file-value"
     secret_file = write_test_secret(secret_directory / "provider-key", upstream_secret)
-    monkeypatch.delenv("TEST_PRIMARY_KEY", raising=False)
-    monkeypatch.setenv("TEST_PRIMARY_KEY_FILE", str(secret_file))
+    monkeypatch.delenv("TEST_PRIMARY_API_KEY", raising=False)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY_FILE", str(secret_file))
     seen_authorization = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -64,8 +64,8 @@ def test_secret_load_failure_sends_no_upstream_request_or_secret_details(streami
     app, db = gateway
     path_marker = "private-secret-path-marker"
     missing_file = secret_directory / path_marker
-    monkeypatch.delenv("TEST_PRIMARY_KEY", raising=False)
-    monkeypatch.setenv("TEST_PRIMARY_KEY_FILE", str(missing_file))
+    monkeypatch.delenv("TEST_PRIMARY_API_KEY", raising=False)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY_FILE", str(missing_file))
     seen = []
     app.state.http_transport = httpx.MockTransport(lambda request: seen.append(request) or httpx.Response(200, json={}))
     token = create_client_key(db, "test-pepper-that-is-at-least-32-bytes-long", "missing-secret", 20)[1]
@@ -165,8 +165,8 @@ def test_provider_secret_and_pepper_are_absent_from_test_database(gateway, monke
     pepper = "synthetic-pepper-never-store-value-at-least-32-bytes"
     provider_file = write_test_secret(secret_directory / "provider-key", provider_secret)
     pepper_file = write_test_secret(secret_directory / "pepper", pepper)
-    monkeypatch.delenv("TEST_PRIMARY_KEY", raising=False)
-    monkeypatch.setenv("TEST_PRIMARY_KEY_FILE", str(provider_file))
+    monkeypatch.delenv("TEST_PRIMARY_API_KEY", raising=False)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY_FILE", str(provider_file))
     monkeypatch.delenv("GATEWAY_PEPPER", raising=False)
     monkeypatch.setenv("GATEWAY_PEPPER_FILE", str(pepper_file))
     seen = []
