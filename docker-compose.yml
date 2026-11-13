@@ -26,6 +26,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    pids_limit: 100
     deploy:
       resources:
         limits:

@@ -69,57 +69,68 @@ grep '^GATEWAY_PEPPER=' ... | cut -d'=' -f2- | tr -d '\r\n'
 **سبب الإلغاء:** الأمر `tr -d '\r\n'` يقوم بحذف أي محرف نهاية سطر في كامل النص بشكل عشوائي، كما أن مقارنة التجزئة لنفس النص المعالج لا تثبت أن بايتات القيمة الأصلية قبل المعالجة مطابقة للبايتات بعد النقل.
 
 ### 2. بروتوكول النقل الخام المعتمد (Zero Normalization Protocol)
-تُنقل القيمة الفعلية كما تقرؤها العملية الحالية في ذاكرتها من `os.environb` مباشرة، دون تعديل أو تطبيع، ودون تمريرها في arguments، ودون حفظها في shell history:
+تُنقل القيمة الفعلية كما تقرؤها العملية الحالية في ذاكرتها من `os.environb` مباشرة، دون تعديل أو تطبيع، ودون تمريرها في arguments، ودون حفظها في shell history عبر سكربت [scripts/migrate_pepper.sh](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/scripts/migrate_pepper.sh) المحمي بـ `set -Eeuo pipefail`:
 
 ```bash
-# 1. إنشاء المجلد المحمي على المضيف
-sudo install -m 0750 -o root -g 10001 -d /etc/ai-gateway/secrets
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# 2. إنشاء الملف الهدف فارغاً بصلاحيات 0400 فوراً قبل استقبال البيانات
-sudo install -m 0400 -o 10001 -g 10001 /dev/null /etc/ai-gateway/secrets/pepper
+CURRENT_CONTAINER="${1:?Usage: $0 <CURRENT_CONTAINER_NAME_OR_ID>}"
+SECRETS_DIR="${SECRETS_DIR:-/etc/ai-gateway/secrets}"
+FINAL_PEPPER="${SECRETS_DIR}/pepper"
+TEMP_PEPPER="${SECRETS_DIR}/.pepper.tmp.$$"
 
-# 3. استخراج البايتات الخام مباشرة من ذاكرة العملية الحالية عبر pipe إلى الملف المحمي:
-docker exec -i <CURRENT_CONTAINER_ID> python -c '
+# تنظيف الملف المؤقت عند أي خطأ أو خروج
+trap 'rm -f "${TEMP_PEPPER}"' EXIT ERR INT TERM
+
+# 1. إنشاء المجلد المحمي والملف المؤقت بصلاحيات 0400 مسبقاً
+sudo install -m 0750 -o root -g 10001 -d "${SECRETS_DIR}"
+sudo install -m 0400 -o 10001 -g 10001 /dev/null "${TEMP_PEPPER}"
+
+# 2. استخراج البايتات الخام مباشرة من ذاكرة العملية الحالية عبر pipe إلى الملف المؤقت:
+docker exec "${CURRENT_CONTAINER}" python -c '
 import os, sys
 raw_bytes = os.environb.get(b"GATEWAY_PEPPER")
-if not raw_bytes or len(raw_bytes) < 32:
-    sys.exit("ABORT: GATEWAY_PEPPER is missing or less than 32 bytes")
+if raw_bytes is None:
+    sys.exit("ABORT: GATEWAY_PEPPER is missing from container")
+if len(raw_bytes) < 32:
+    sys.exit(f"ABORT: GATEWAY_PEPPER length is {len(raw_bytes)} bytes; minimum required is 32 bytes")
 # شرط التوقف الصارم: إذا وُجدت فواصل أسطر داخلية ملتبسة في البيئة، توقف فوراً ولا تغير شيئاً
 if b"\n" in raw_bytes or b"\r" in raw_bytes:
     sys.exit("ABORT: In-memory Pepper contains line breaks; stopping to prevent key corruption")
 sys.stdout.buffer.write(raw_bytes)
-' | sudo tee /etc/ai-gateway/secrets/pepper > /dev/null
-```
+' | sudo tee "${TEMP_PEPPER}" > /dev/null
 
-### 3. إثبات التكافؤ عبر بصمة SHA-256 المستقلة
-يتم حساب بصمة التجزئة للمصدر (ذاكرة العملية الحالية) ومقارنتها ببصمة الملف المنقول بشكل مستقل تماماً ودون طباعة السر:
-```bash
-SRC_SHA=$(docker exec -i <CURRENT_CONTAINER_ID> python -c '
-import os, hashlib, sys
-raw = os.environb.get(b"GATEWAY_PEPPER", b"")
-sys.stdout.write(hashlib.sha256(raw).hexdigest())
-')
+# 3. التحقق المستقل من الحجم
+SRC_SIZE=$(docker exec "${CURRENT_CONTAINER}" python -c 'import os, sys; b=os.environb.get(b"GATEWAY_PEPPER", b""); sys.stdout.write(str(len(b)))')
+DST_SIZE=$(sudo wc -c < "${TEMP_PEPPER}")
+[ "${SRC_SIZE}" -ge 32 ] && [ "${SRC_SIZE}" -eq "${DST_SIZE}" ] || { echo "ERROR: Size mismatch"; exit 1; }
 
-DST_SHA=$(sudo sha256sum /etc/ai-gateway/secrets/pepper | awk '{print $1}')
+# 4. التحقق المستقل من بصمة SHA-256 (مع رفض البصمة الفارغة قطيعاً)
+EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+SRC_SHA=$(docker exec "${CURRENT_CONTAINER}" python -c 'import os, hashlib, sys; b=os.environb.get(b"GATEWAY_PEPPER", b""); sys.stdout.write(hashlib.sha256(b).hexdigest())')
+DST_SHA=$(sudo sha256sum "${TEMP_PEPPER}" | awk '{print $1}')
 
-if [ "$SRC_SHA" = "$DST_SHA" ] && [ -n "$SRC_SHA" ]; then
-    echo "PEPPER_VERIFICATION=MATCHED (SHA-256 verified identical byte-for-byte)"
-else
-    echo "ERROR: PEPPER_VERIFICATION=FAILED (MISMATCH)" && exit 1
+if [ "$SRC_SHA" = "$EMPTY_SHA" ] || [ "$DST_SHA" = "$EMPTY_SHA" ] || [ "$SRC_SHA" != "$DST_SHA" ]; then
+    echo "ERROR: SHA-256 mismatch or empty payload" && exit 1
 fi
-```
 
-### 4. فحص التكافؤ الوظيفي في توليد HMAC
-قبل تنفيذ Cutover، يتم التأكد من أن القيمة المقروءة من الملف في الحاوية المرشحة تنتج نفس توقيع HMAC لمفتاح عميل تجريبي مقارنة بالقيمة القديمة:
-```bash
-# التحقق من أن resolve_secret يولد نفس توقيع HMAC دون كشف السر:
-docker exec -i <CANDIDATE_CONTAINER_ID> python -c '
-import hmac, hashlib
-from app.secret_loader import resolve_secret
-p = resolve_secret("GATEWAY_PEPPER").encode("utf-8")
-sig = hmac.new(p, b"gw_canary_test_token", hashlib.sha256).hexdigest()
-print(f"PEPPER_HMAC_CANARY={sig}")
-'
+# 5. التكافؤ الوظيفي لتوليد HMAC في الذاكرة دون كشف السر أو التوقيع
+HMAC_MATCH=$(python3 -c '
+import subprocess, sys, hmac, hashlib
+token = b"canary_verify_token"
+src = subprocess.check_output(["docker", "exec", sys.argv[1], "python", "-c", "import os, hmac, hashlib, sys; sys.stdout.write(hmac.new(os.environb.get(b\"GATEWAY_PEPPER\", b\"\"), sys.argv[1].encode(), hashlib.sha256).hexdigest())", token.decode()], text=True).strip()
+with open(sys.argv[2], "rb") as f:
+    dst = hmac.new(f.read(), token, hashlib.sha256).hexdigest()
+sys.stdout.write("MATCH" if src == dst and len(src) == 64 else "MISMATCH")
+' "${CURRENT_CONTAINER}" "${TEMP_PEPPER}")
+[ "$HMAC_MATCH" = "MATCH" ] || { echo "ERROR: HMAC check failed"; exit 1; }
+
+# 6. النقل الذري النهائي
+sudo mv "${TEMP_PEPPER}" "${FINAL_PEPPER}"
+sudo chown 10001:10001 "${FINAL_PEPPER}"
+sudo chmod 0400 "${FINAL_PEPPER}"
+echo "PEPPER_ATOMIC_MIGRATION=SUCCESS"
 ```
 
 ---

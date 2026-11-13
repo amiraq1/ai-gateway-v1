@@ -340,17 +340,17 @@ jobs:
           print("PASS: Secrets opened and resolved successfully by UID 10001:10001 from 0750 parent directory")
           '
 
-          # Test admin CLI inside container to create key
+          # Test admin CLI inside container to create key (suppress api_key from logs)
           echo "Creating client key inside container..."
           CREATE_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin create-key --name test-app --rpm 60)
-          echo "create-key output: ${CREATE_OUTPUT}"
 
-          # Extract client_id from output (format: client_id=<hex>)
+          # Extract client_id only without printing raw API key
           CLIENT_ID=$(echo "${CREATE_OUTPUT}" | grep "client_id=" | head -n1 | cut -d'=' -f2 | tr -d '[:space:]')
           echo "Extracted client_id: ${CLIENT_ID}"
           if [ -z "${CLIENT_ID}" ]; then
             echo "FAIL: Could not extract client_id from create-key output" && exit 1
           fi
+          echo "PASS: Client key created successfully (raw API token suppressed from CI logs)"
 
           # Test list-clients inside container
           echo "Listing clients inside container..."
@@ -367,6 +367,14 @@ jobs:
             echo "FAIL: Expected 'revoked' but got '${REVOKE_OUTPUT}'" && exit 1
           fi
           echo "PASS: Client ${CLIENT_ID} revoked successfully"
+
+          # Test backup script against standalone running candidate container
+          echo "Testing scripts/backup.sh against candidate container..."
+          sh scripts/backup.sh /tmp/ci-host-backup.sqlite3
+          if [ ! -s /tmp/ci-host-backup.sqlite3 ]; then
+            echo "FAIL: Backup file on host is missing or empty" && exit 1
+          fi
+          echo "PASS: scripts/backup.sh executed, transferred, and verified successfully on host"
 
           # Verify /data permissions and contents
           echo "Verifying /data tmpfs permissions:"

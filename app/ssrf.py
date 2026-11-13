@@ -16,8 +16,34 @@ class SSRFProtectionError(ValueError):
     pass
 
 
+_SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+_EXPLICIT_FORBIDDEN_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),     # RFC 6598 Carrier-Grade NAT (Shared Address Space)
+    ipaddress.ip_network("169.254.0.0/16"),    # RFC 3927 Link-local / Cloud metadata (e.g. 169.254.169.254)
+    ipaddress.ip_network("127.0.0.0/8"),       # RFC 1122 Loopback
+    ipaddress.ip_network("0.0.0.0/8"),         # RFC 1122 'This host on this network'
+    ipaddress.ip_network("10.0.0.0/8"),        # RFC 1918 Private-Use
+    ipaddress.ip_network("172.16.0.0/12"),     # RFC 1918 Private-Use
+    ipaddress.ip_network("192.168.0.0/16"),    # RFC 1918 Private-Use
+    ipaddress.ip_network("192.0.0.0/24"),      # RFC 6890 IETF Protocol Assignments
+    ipaddress.ip_network("192.0.2.0/24"),      # RFC 5737 Documentation (TEST-NET-1)
+    ipaddress.ip_network("198.18.0.0/15"),     # RFC 2544 Network Interconnect Device Benchmark
+    ipaddress.ip_network("198.51.100.0/24"),   # RFC 5737 Documentation (TEST-NET-2)
+    ipaddress.ip_network("203.0.113.0/24"),    # RFC 5737 Documentation (TEST-NET-3)
+    ipaddress.ip_network("240.0.0.0/4"),       # RFC 1112 Reserved for Future Use
+    ipaddress.ip_network("224.0.0.0/4"),       # RFC 5771 Multicast
+    ipaddress.ip_network("fc00::/7"),          # RFC 4193 IPv6 Unique Local Address (ULA)
+    ipaddress.ip_network("fe80::/10"),         # RFC 4291 IPv6 Link-Local
+    ipaddress.ip_network("::1/128"),           # RFC 4291 IPv6 Loopback
+    ipaddress.ip_network("::/128"),            # RFC 4291 IPv6 Unspecified
+    ipaddress.ip_network("ff00::/8"),          # RFC 4291 IPv6 Multicast
+    ipaddress.ip_network("100::/64"),          # RFC 6666 IPv6 Discard-Only prefix
+    ipaddress.ip_network("2001:db8::/32"),     # RFC 3849 IPv6 Documentation
+)
+
+
 def is_ip_forbidden(ip_obj_or_str: ipaddress.IPv4Address | ipaddress.IPv6Address | str) -> bool:
-    """Check if an IP address is internal, private, loopback, link-local, multicast, or reserved."""
+    """Check if an IP address is internal, private, loopback, link-local, multicast, shared, or reserved."""
     try:
         if isinstance(ip_obj_or_str, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
             ip = ip_obj_or_str
@@ -32,7 +58,11 @@ def is_ip_forbidden(ip_obj_or_str: ipaddress.IPv4Address | ipaddress.IPv6Address
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
 
-        # Check all forbidden ranges
+        # Universal global routability check
+        if not ip.is_global:
+            return True
+
+        # Check standard forbidden ranges
         if (
             ip.is_private
             or ip.is_loopback
@@ -43,14 +73,9 @@ def is_ip_forbidden(ip_obj_or_str: ipaddress.IPv4Address | ipaddress.IPv6Address
         ):
             return True
 
-        # Explicit check for 169.254.0.0/16 (cloud metadata) and 127.0.0.0/8 (loopback)
-        ip_str = str(ip)
-        if ip_str.startswith("169.254.") or ip_str.startswith("127."):
-            return True
-
-        # Check for IPv6 ULA (fc00::/7) and link-local (fe80::/10)
-        if isinstance(ip, ipaddress.IPv6Address):
-            if ip.is_site_local or ip.is_link_local:
+        # Check against explicit forbidden networks (defense-in-depth)
+        for net in _EXPLICIT_FORBIDDEN_NETWORKS:
+            if ip in net:
                 return True
 
         return False

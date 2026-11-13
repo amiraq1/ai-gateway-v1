@@ -45,20 +45,27 @@
 ## التثبيت والتشغيل عبر Docker Compose
 
 الملفات التشغيلية متتبعة في المستودع:
-- `docker-compose.yml`: يعرّف ربط المنفذ على `127.0.0.1:8000:8000` لتقييد الوصول إلى المضيف المحلي فقط (Localhost Binding).
-- `scripts/init_env.sh`: توليد ملف `.env` و`GATEWAY_PEPPER` عشوائي آمن.
+- `docker-compose.yml`: يعرّف ربط المنفذ على `127.0.0.1:8000:8000` لتقييد الوصول إلى المضيف المحلي فقط، ويعتمد نظام ملفات للقراءة فقط (`read_only: true`) مع نظام ملفات مؤقت `tmpfs`، وحدود استهلاك الموارد (`pids_limit: 100`, `memory: 512M`).
+- `scripts/init_env.sh`: تهيئة أسرار الإنتاج في `/etc/ai-gateway/secrets/` عبر `--production`، أو تهيئة `.env` للتطوير المحلي فقط.
 - `scripts/health_check.sh`: فحص نقطة `/healthz` المحلية.
-- `scripts/backup.sh`: أخذ نسخة احتياطية آمنة لقاعدة بيانات SQLite باستخدام SQLite Online Backup API.
+- `scripts/backup.sh`: أخذ نسخة احتياطية آمنة لقاعدة بيانات SQLite ونقلها خارج الـ Volume إلى المضيف مع فحص `PRAGMA integrity_check`.
 
-### خطوات التشغيل:
+### خطوات التشغيل للإنتاج:
 
-1. **إنشاء متغيرات البيئة والـ Pepper**:
+1. **تهيئة ملفات الأسرار المحمية (Production File-Based Secrets)**:
    ```sh
-   ./scripts/init_env.sh
+   sudo ./scripts/init_env.sh --production
+   ```
+   يقوم السكربت بإنشاء المجلد `/etc/ai-gateway/secrets` بصلاحيات `0750` ومملوكاً لـ `root:10001`، وتوليد سر `pepper` عشوائي بصلاحيات `0400` مملوكاً لـ `10001:10001`.
+   
+   لإضافة مفتاح المزود (مثل OpenRouter):
+   ```sh
+   echo -n "YOUR_OPENROUTER_KEY" | sudo tee /etc/ai-gateway/secrets/openrouter_key > /dev/null
+   sudo chown 10001:10001 /etc/ai-gateway/secrets/openrouter_key && sudo chmod 0400 /etc/ai-gateway/secrets/openrouter_key
    ```
 
 2. **إعداد المزودين والنماذج**:
-   انسخ `config/config.example.yaml` إلى `config/config.yaml`، واضبط المزودات وعناوين HTTPS الخاصة بها، ثم ضع المفاتيح في `.env`.
+   انسخ `config/config.example.yaml` إلى `config/config.yaml`، واضبط المزودات المفعلة وعناوين HTTPS المعتمدة الخاصة بها.
 
 3. **فحص سلامة ملف Compose**:
    ```sh
@@ -74,6 +81,9 @@
    ```sh
    ./scripts/health_check.sh
    ```
+
+> [!NOTE]
+> ملف `.env` مخصص حصراً للتطوير المحلي المباشر خارج الحاويات. في بيئات الإنتاج، تُقرأ الأسرار حصراً عبر ملفات محمية بمسارات `*_FILE`.
 
 ---
 

@@ -95,3 +95,36 @@ def test_valid_https_provider_is_accepted():
     assert _validate_api_base("https://api.anthropic.com/v1", "anthropic") == "https://api.anthropic.com/v1"
     assert _validate_api_base("https://openrouter.ai/api/v1", "openrouter") == "https://openrouter.ai/api/v1"
     assert _validate_api_base("https://primary.example/v1", "test") == "https://primary.example/v1"
+
+
+def test_ssrf_rejects_shared_address_space_and_non_global_ips():
+    # RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://100.64.0.1/v1", "test-provider")
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://100.127.255.254/v1", "test-provider")
+
+    # RFC 2544 Benchmarking (198.18.0.0/15)
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://198.18.0.1/v1", "test-provider")
+
+    # RFC 5737 Documentation TEST-NETs
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://192.0.2.1/v1", "test-provider")
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://198.51.100.1/v1", "test-provider")
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://203.0.113.1/v1", "test-provider")
+
+    # RFC 1112 Reserved (240.0.0.0/4)
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://240.0.0.1/v1", "test-provider")
+
+    # RFC 3849 IPv6 Documentation (2001:db8::/32)
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://[2001:db8::1]/v1", "test-provider")
+
+    # RFC 6666 IPv6 Discard prefix (100::/64)
+    with pytest.raises(ValueError, match="forbidden IP address"):
+        _validate_api_base("https://[100::1]/v1", "test-provider")
+
