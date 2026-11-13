@@ -1,0 +1,362 @@
+name: Phase D Linux & Docker Security Validation
+
+on:
+  push:
+    branches:
+      - audit/2026-11-13-c1
+  pull_request:
+    branches:
+      - main
+      - audit/2026-11-13-c1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-validation:
+    name: Ubuntu Linux POSIX & Docker Validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify Environment & Host Tools
+        run: |
+          echo "=== LINUX HOST ENVIRONMENT ==="
+          uname -a
+          echo "Kernel: $(uname -r)"
+          echo "Architecture: $(uname -m)"
+          docker --version
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Development Dependencies with Hashes
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir --require-hashes -r requirements-dev.lock
+
+      - name: Run Full Linux POSIX Pytest Suite
+        run: |
+          echo "=== RUNNING FULL PYTEST SUITE ON LINUX ==="
+          pytest -v --durations=10
+
+      - name: Run Mutation Tests (HMAC and Rate Limiting)
+        run: |
+          echo "=== RUNNING MUTATION TESTS ==="
+          # 1. Mutate HMAC check
+          python -c '
+          from pathlib import Path
+          p = Path("app/auth.py")
+          text = p.read_text(encoding="utf-8")
+          mutated = text.replace("matches = hmac.compare_digest(expected, target_digest)", "matches = True  # MUTATED")
+          p.write_text(mutated, encoding="utf-8")
+          '
+          if pytest -q tests/test_forged_hmac.py; then
+            echo "FAIL: HMAC mutation survived!" && exit 1
+          else
+            echo "PASS: HMAC mutation killed successfully."
+          fi
+          git checkout app/auth.py
+
+          # 2. Mutate Rate Limit check
+          python -c '
+          from pathlib import Path
+          p = Path("app/database.py")
+          text = p.read_text(encoding="utf-8")
+          mutated = text.replace("if count >= rpm:", "if False:  # MUTATED")
+          p.write_text(mutated, encoding="utf-8")
+          '
+          if pytest -q tests/test_api.py::test_rate_limit_is_persisted_and_returns_retry_after; then
+            echo "FAIL: Rate limit mutation survived!" && exit 1
+          else
+            echo "PASS: Rate limit mutation killed successfully."
+          fi
+          git checkout app/database.py
+
+      - name: Run S5 Canary Leakage Test
+        run: |
+          echo "=== RUNNING S5 CANARY LEAKAGE TEST ==="
+          python - << 'EOF'
+          import io
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+          import httpx
+          from fastapi.testclient import TestClient
+
+          from app.auth import create_client_key, digest_key
+          from app.config import GatewayConfig, GatewaySettings, ModelConfig, ProviderConfig
+          from app.database import Database
+          from app.main import create_app
+
+          CANARY_PROMPT = "CANARY_MESSAGE_CONTENT_9f83b271d4a0"
+          CANARY_AUTH_SUFFIX = "CANARY_AUTH_TOKEN_4e7a2b91c80f"
+          CANARY_PROVIDER_SECRET = "CANARY_PROVIDER_SECRET_8b31f0a29d5e"
+          PEPPER = "test-pepper-that-is-at-least-32-bytes-long"
+
+          temp_dir = tempfile.TemporaryDirectory()
+          db_path = Path(temp_dir.name) / "canary.sqlite3"
+          db = Database(str(db_path))
+          db.init()
+
+          client_id = "0123456789abcdef"
+          raw_key = f"gw_{client_id}.{CANARY_AUTH_SUFFIX}"
+          db.add_client(client_id, digest_key(raw_key, PEPPER), "canary-client", 100)
+
+          os.environ["TEST_PRIMARY_KEY"] = CANARY_PROVIDER_SECRET
+          os.environ["GATEWAY_PEPPER"] = PEPPER
+
+          providers = (
+              ProviderConfig("primary", "test-primary-model", "https://primary.example/v1", "TEST_PRIMARY_KEY", True),
+          )
+          settings = GatewaySettings("127.0.0.1", 8000, str(db_path), 2.0, 1048576, 30)
+          cfg = GatewayConfig(settings, {"fast": ModelConfig("fast", True, providers)})
+          app = create_app(cfg, db)
+
+          def mock_handler(request: httpx.Request) -> httpx.Response:
+              auth = request.headers.get("authorization", "")
+              assert CANARY_PROVIDER_SECRET in auth
+              return httpx.Response(200, json={
+                  "id": "c1", "object": "chat.completion", "created": 1, "model": "fast",
+                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "safe answer"}, "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+              })
+
+          app.state.http_transport = httpx.MockTransport(mock_handler)
+
+          captured_stdout = io.StringIO()
+          captured_stderr = io.StringIO()
+          sys_stdout = sys.stdout
+          sys_stderr = sys.stderr
+
+          client_responses = []
+          try:
+              sys.stdout = captured_stdout
+              sys.stderr = captured_stderr
+
+              with TestClient(app) as client:
+                  # 1. Normal Request
+                  r1 = client.post("/v1/chat/completions",
+                                   headers={"Authorization": f"Bearer {raw_key}"},
+                                   json={"model": "fast", "messages": [{"role": "user", "content": CANARY_PROMPT}]})
+                  client_responses.append(("normal_200", r1.status_code, r1.text))
+
+                  # 2. 422 Validation Error
+                  r2 = client.post("/v1/chat/completions",
+                                   headers={"Authorization": f"Bearer {raw_key}"},
+                                   json={"model": "fast", "messages": f"invalid_{CANARY_PROMPT}"})
+                  client_responses.append(("validation_422", r2.status_code, r2.text))
+
+                  # 3. 502 Upstream Failure
+                  def fail_handler(request: httpx.Request) -> httpx.Response:
+                      return httpx.Response(500, json={"error": f"upstream_leak_{CANARY_PROVIDER_SECRET}"})
+                  app.state.http_transport = httpx.MockTransport(fail_handler)
+                  r3 = client.post("/v1/chat/completions",
+                                   headers={"Authorization": f"Bearer {raw_key}"},
+                                   json={"model": "fast", "messages": [{"role": "user", "content": CANARY_PROMPT}]})
+                  client_responses.append(("upstream_error_502", r3.status_code, r3.text))
+
+                  # 4. Bad Auth
+                  r4 = client.post("/v1/chat/completions",
+                                   headers={"Authorization": f"Bearer gw_bad_{CANARY_AUTH_SUFFIX}"},
+                                   json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]})
+                  client_responses.append(("bad_auth_401", r4.status_code, r4.text))
+          finally:
+              sys.stdout = sys_stdout
+              sys.stderr = sys_stderr
+
+          stdout_val = captured_stdout.getvalue()
+          stderr_val = captured_stderr.getvalue()
+
+          db_bytes = bytearray()
+          for p in [db_path, db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")]:
+              if p.exists():
+                  db_bytes.extend(p.read_bytes())
+
+          all_responses_text = "\n".join(r[2] for r in client_responses)
+          all_stdout_stderr = stdout_val + "\n" + stderr_val
+
+          canaries = {
+              "CANARY_PROMPT": CANARY_PROMPT,
+              "CANARY_AUTH_SUFFIX": CANARY_AUTH_SUFFIX,
+              "CANARY_PROVIDER_SECRET": CANARY_PROVIDER_SECRET,
+          }
+
+          leaks_found = False
+          for name, secret in canaries.items():
+              in_stdout_stderr = secret in all_stdout_stderr
+              in_responses = secret in all_responses_text
+              in_db = secret.encode("utf-8") in db_bytes
+              if in_stdout_stderr or in_responses or in_db:
+                  leaks_found = True
+                  print(f"FAIL: {name} leaked!")
+              else:
+                  print(f"PASS: {name} SECURE (NOT LEAKED)")
+
+          assert not leaks_found, "CANARY TEST FAILED - SECRETS LEAKED"
+          print("CANARY VERDICT: PASSED - ZERO SECRETS LEAKED")
+          temp_dir.cleanup()
+          EOF
+
+      - name: Verify Transport DNS & SSRF Protection
+        run: |
+          echo "=== RUNNING DNS & SSRF INTEGRATION TESTS ==="
+          pytest -v tests/test_ssrf_protection.py tests/test_dns_rebinding.py tests/test_linux_ssrf_integration.py
+
+      - name: Build Docker Candidate Image
+        run: |
+          echo "=== BUILDING DOCKER CANDIDATE IMAGE ==="
+          docker build -t ai-gateway-v1:phase-d-linux-candidate .
+
+      - name: Inspect Docker Candidate Image Security
+        run: |
+          echo "=== INSPECTING DOCKER CANDIDATE IMAGE ==="
+          IMAGE_ID=$(docker image inspect ai-gateway-v1:phase-d-linux-candidate --format '{{.Id}}')
+          IMAGE_SIZE=$(docker image inspect ai-gateway-v1:phase-d-linux-candidate --format '{{.Size}}')
+          DEFAULT_USER=$(docker image inspect ai-gateway-v1:phase-d-linux-candidate --format '{{.Config.User}}')
+          echo "Image ID: ${IMAGE_ID}"
+          echo "Image Size: ${IMAGE_SIZE} bytes"
+          echo "Default User: ${DEFAULT_USER}"
+
+          # Verify non-root user
+          if [ "${DEFAULT_USER}" != "10001:10001" ]; then
+            echo "FAIL: Expected user 10001:10001, got ${DEFAULT_USER}" && exit 1
+          fi
+
+          # Verify pytest is NOT installed in production image
+          if docker run --rm ai-gateway-v1:phase-d-linux-candidate python -m pytest --version 2>/dev/null; then
+            echo "FAIL: pytest is present in candidate image!" && exit 1
+          else
+            echo "PASS: pytest is not present in candidate image"
+          fi
+
+          # Verify no .env or sensitive config exists in image
+          docker run --rm ai-gateway-v1:phase-d-linux-candidate sh -c '
+            test ! -f /app/.env && \
+            test ! -f /app/config/config.yaml && \
+            test -f /app/config/config.example.yaml
+          '
+          echo "PASS: No sensitive configs or .env inside candidate image"
+
+      - name: Test Candidate Container in Strict Isolation
+        run: |
+          echo "=== TESTING CANDIDATE CONTAINER IN STRICT ISOLATION ==="
+          
+          # Setup mock secrets directory with ownership 10001:10001 and mode 0400
+          MOCK_SECRETS_DIR="/tmp/phase-d-mock-secrets"
+          mkdir -p "${MOCK_SECRETS_DIR}"
+          echo -n "test-pepper-synthetic-at-least-32-chars-long" > "${MOCK_SECRETS_DIR}/pepper"
+          echo -n "mock-openrouter-secret-token" > "${MOCK_SECRETS_DIR}/openrouter_key"
+          sudo chown -R 10001:10001 "${MOCK_SECRETS_DIR}"
+          sudo chmod 0700 "${MOCK_SECRETS_DIR}"
+          sudo chmod 0400 "${MOCK_SECRETS_DIR}/pepper" "${MOCK_SECRETS_DIR}/openrouter_key"
+
+          # Setup mock config
+          MOCK_CONFIG_DIR="/tmp/phase-d-mock-config"
+          mkdir -p "${MOCK_CONFIG_DIR}"
+          cat << 'EOF' > "${MOCK_CONFIG_DIR}/config.yaml"
+          settings:
+            host: 0.0.0.0
+            port: 8000
+            database_path: /data/gateway.sqlite3
+          models:
+            fast:
+              enabled: true
+              providers:
+                - name: openrouter
+                  model: anthropic/claude-3.5-sonnet
+                  api_base: https://openrouter.ai/api/v1
+                  api_key_env: OPENROUTER_API_KEY
+                  enabled: true
+          EOF
+          sudo chown -R 10001:10001 "${MOCK_CONFIG_DIR}"
+          sudo chmod 0644 "${MOCK_CONFIG_DIR}/config.yaml"
+
+          # Run candidate container with strict isolation flags
+          docker run -d --name ai-gateway-v1-phase-d-candidate \
+            --network none \
+            --user 10001:10001 \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --restart no \
+            --memory 512m \
+            --cpus 1.0 \
+            --tmpfs /data:uid=10001,gid=10001,mode=0700 \
+            --tmpfs /tmp:uid=10001,gid=10001,mode=0700 \
+            -v "${MOCK_SECRETS_DIR}":/secrets:ro \
+            -v "${MOCK_CONFIG_DIR}/config.yaml":/app/config/config.yaml:ro \
+            -e GATEWAY_CONFIG=/app/config/config.yaml \
+            -e GATEWAY_PEPPER_FILE=/secrets/pepper \
+            -e OPENROUTER_API_KEY_FILE=/secrets/openrouter_key \
+            ai-gateway-v1:phase-d-linux-candidate
+
+          sleep 3
+
+          # Verify container is running
+          CONTAINER_STATUS=$(docker inspect ai-gateway-v1-phase-d-candidate --format '{{.State.Status}}')
+          echo "Candidate container status: ${CONTAINER_STATUS}"
+          if [ "${CONTAINER_STATUS}" != "running" ]; then
+            echo "FAIL: Container is not running!"
+            docker logs ai-gateway-v1-phase-d-candidate
+            exit 1
+          fi
+
+          # Verify Docker Config.Env does not contain literal secrets
+          CONTAINER_ENV=$(docker inspect ai-gateway-v1-phase-d-candidate --format '{{json .Config.Env}}')
+          echo "Inspecting container env vars (safe check):"
+          echo "${CONTAINER_ENV}" | grep -v "mock-openrouter-secret-token" | grep -v "test-pepper-synthetic"
+          if echo "${CONTAINER_ENV}" | grep -q "mock-openrouter-secret-token"; then
+            echo "FAIL: Literal secret found in Docker Config.Env!" && exit 1
+          fi
+          echo "PASS: Zero literal secrets in Docker Config.Env (uses _FILE paths only)"
+
+          # Test admin CLI inside container to create key
+          echo "Creating client key inside container..."
+          CREATE_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin create-key --name test-app --rpm 60)
+          echo "create-key output: ${CREATE_OUTPUT}"
+
+          # Extract client_id from output (format: client_id: <hex> \n raw_key: <key>)
+          CLIENT_ID=$(echo "${CREATE_OUTPUT}" | grep "client_id:" | awk '{print $2}')
+          echo "Extracted client_id: ${CLIENT_ID}"
+
+          # Test list-clients inside container
+          echo "Listing clients inside container..."
+          LIST_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin list-clients)
+          echo "list-clients output: ${LIST_OUTPUT}"
+          echo "${LIST_OUTPUT}" | grep -q "${CLIENT_ID}"
+          echo "PASS: Client ${CLIENT_ID} found in SQLite database"
+
+          # Test revoke-key inside container
+          echo "Revoking key inside container..."
+          REVOKE_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin revoke-key "${CLIENT_ID}")
+          echo "revoke-key output: ${REVOKE_OUTPUT}"
+          echo "${REVOKE_OUTPUT}" | grep -q "Revoked"
+          echo "PASS: Client ${CLIENT_ID} revoked successfully"
+
+          # Verify /data permissions and contents
+          echo "Verifying /data tmpfs permissions:"
+          docker exec -i ai-gateway-v1-phase-d-candidate ls -la /data
+
+          # Check container logs for leaks
+          echo "Verifying container logs:"
+          CONTAINER_LOGS=$(docker logs ai-gateway-v1-phase-d-candidate 2>&1)
+          if echo "${CONTAINER_LOGS}" | grep -q "mock-openrouter-secret-token"; then
+            echo "FAIL: Secret leaked into container logs!" && exit 1
+          fi
+          echo "PASS: Zero secret leaks in container logs"
+
+          # Clean up container and test directories
+          docker stop ai-gateway-v1-phase-d-candidate
+          docker rm ai-gateway-v1-phase-d-candidate
+          sudo rm -rf "${MOCK_SECRETS_DIR}" "${MOCK_CONFIG_DIR}"
+          echo "Candidate container validation COMPLETED WITH SUCCESS."
