@@ -22,6 +22,9 @@ def create_client_key(db: Database, pepper: str, name: str, rpm: int = 60, now: 
     return client_id, raw_key
 
 
+_DUMMY_DIGEST = "0" * 64
+
+
 def authenticate_key(db: Database, pepper: str, raw_key: str | None) -> dict[str, Any] | None:
     if not raw_key or len(raw_key) > 256 or not raw_key.startswith("gw_") or "." not in raw_key:
         return None
@@ -33,9 +36,9 @@ def authenticate_key(db: Database, pepper: str, raw_key: str | None) -> dict[str
     except ValueError:
         return None
     client = db.get_client(client_id)
-    if not client or client["revoked_at"] is not None:
-        return None
-    if not hmac.compare_digest(expected, client["key_digest"]):
+    target_digest = client["key_digest"] if client else _DUMMY_DIGEST
+    matches = hmac.compare_digest(expected, target_digest)
+    if not client or client["revoked_at"] is not None or not matches:
         return None
     return client
 
