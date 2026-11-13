@@ -325,22 +325,27 @@ jobs:
           CREATE_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin create-key --name test-app --rpm 60)
           echo "create-key output: ${CREATE_OUTPUT}"
 
-          # Extract client_id from output (format: client_id: <hex> \n raw_key: <key>)
-          CLIENT_ID=$(echo "${CREATE_OUTPUT}" | grep "client_id:" | awk '{print $2}')
+          # Extract client_id from output (format: client_id=<hex>)
+          CLIENT_ID=$(echo "${CREATE_OUTPUT}" | grep "client_id=" | head -n1 | cut -d'=' -f2 | tr -d '[:space:]')
           echo "Extracted client_id: ${CLIENT_ID}"
+          if [ -z "${CLIENT_ID}" ]; then
+            echo "FAIL: Could not extract client_id from create-key output" && exit 1
+          fi
 
           # Test list-clients inside container
           echo "Listing clients inside container..."
           LIST_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin list-clients)
           echo "list-clients output: ${LIST_OUTPUT}"
-          echo "${LIST_OUTPUT}" | grep -q "${CLIENT_ID}"
+          echo "${LIST_OUTPUT}" | grep -q "client_id=${CLIENT_ID}"
           echo "PASS: Client ${CLIENT_ID} found in SQLite database"
 
           # Test revoke-key inside container
           echo "Revoking key inside container..."
           REVOKE_OUTPUT=$(docker exec -i ai-gateway-v1-phase-d-candidate python -m app.admin revoke-key "${CLIENT_ID}")
           echo "revoke-key output: ${REVOKE_OUTPUT}"
-          echo "${REVOKE_OUTPUT}" | grep -q "Revoked"
+          if [ "${REVOKE_OUTPUT}" != "revoked" ]; then
+            echo "FAIL: Expected 'revoked' but got '${REVOKE_OUTPUT}'" && exit 1
+          fi
           echo "PASS: Client ${CLIENT_ID} revoked successfully"
 
           # Verify /data permissions and contents
