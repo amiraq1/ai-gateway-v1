@@ -14,5 +14,8 @@ tests
 *.key
 secrets/
 **/secrets/**
+config/*.yaml
+config/*.yml
+!config/config.example.yaml
 data
 backups
