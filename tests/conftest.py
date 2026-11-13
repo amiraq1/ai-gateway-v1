@@ -16,6 +16,8 @@ from app import secret_loader
 @pytest.fixture
 def secret_directory(monkeypatch):
     """Create private test files while simulating the container's runtime identity."""
+    if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+        pytest.skip("POSIX container runtime identity simulation requires POSIX OS")
     root = Path(tempfile.mkdtemp(prefix=".secret-tests-", dir=Path(__file__).resolve().parent))
     os.chmod(root, 0o700)
     monkeypatch.setattr(secret_loader, "RUNTIME_UID", os.getuid())

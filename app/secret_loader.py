@@ -10,8 +10,18 @@ RUNTIME_UID = 10001
 RUNTIME_GID = 10001
 SAFE_DIRECTORY_UIDS = frozenset({0, RUNTIME_UID})
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
-_SECRET_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+_DIRECTORY_FLAGS = (
+    getattr(os, "O_RDONLY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+)
+_SECRET_FLAGS = (
+    getattr(os, "O_RDONLY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
 
 
 class SecretLoadError(Exception):
@@ -57,6 +67,8 @@ def _check_directory(fd: int) -> None:
 
 
 def _read_secret_file(raw_path: str) -> str:
+    if os.name != "posix":
+        raise _unavailable()
     try:
         path = Path(raw_path)
         parts = path.parts
