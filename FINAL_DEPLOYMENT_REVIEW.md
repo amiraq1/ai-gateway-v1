@@ -2,10 +2,10 @@
 
 **التاريخ:** 13 نوفمبر 2026  
 **الفرع المعتمد للمراجعة:** `audit/2026-11-13-c1`  
-**الالتزام المعتمد والمختبر في CI:** `8e987a0`  
+**الالتزام المعتمد والمختبر في CI:** `2ebc857`  
 **الالتزام الأساسي:** `f98c189`  
-**معرف تشغيل التحقق المستقل في GitHub Actions:** `43492784228`  
-**معرف الصورة المرشحة في CI:** `sha256:18c76303a78d35142ad05e02308ae58e318dc20d6d7b6db5150baaa3a593a439`  
+**معرف تشغيل التحقق المستقل في GitHub Actions:** `43496356039`  
+**معرف الصورة المرشحة في CI:** `sha256:879e05c8994d8a6af0dece2059594cacfde9184e64353693edf701a93e5581dc`  
 **القرار النهائي:** `READY FOR OWNER CUTOVER APPROVAL` (نافذة التبديل معلقة بانتظار موافقة المالك)
 
 ---
@@ -19,7 +19,7 @@
 | **3. فحص Docker Config.Env دون كشف الأسرار** | **PASS** | استبدال `grep` بأمر فحص آمن يطبع أسماء المتغيرات فقط (`GATEWAY_PEPPER_DIRECT=ABSENT`، `GATEWAY_PEPPER_FILE=PRESENT`) دون أي إخراج لقيم أو JSON. |
 | **4. تحديث إعداد Compose وسكربت النسخ الاحتياطي** | **PASS** | تحديث `docker-compose.yml` ليعتمد `*_FILE` و `--read-only` وحدود الموارد؛ وتحديث `scripts/backup.sh` ليدعم الحاويات المشغلة بـ `docker run` و Compose. |
 | **5. توثيق هوية الصورة ونقلها** | **PASS** | توثيق الفرق بين Image ID في CI وإعادة البناء على الإنتاج؛ واشتراط قياس Image ID وفحص الصورة قبل التبديل، أو استخدام `docker save/load` كأثر منقول. |
-| **6. اختبار التوافق العكسي لـ SQLite والتراجع** | **PASS** | إنجاز اختبار مستقل شامل ([test_sqlite_backward_compatibility.py](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/tests/test_sqlite_backward_compatibility.py))؛ أثبت سلامة الترحيل وعدم فقدان أي بيانات عند التراجع لإصدار التطبيق القديم (104 اختبارات ناجحة في CI). |
+| **6. اختبار التوافق العكسي لـ SQLite والتراجع** | **PASS** | إنجاز اختبار مستقل شامل ([test_sqlite_backward_compatibility.py](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/tests/test_sqlite_backward_compatibility.py))؛ أثبت سلامة الترحيل وعدم فقدان أي بيانات عند التراجع لإصدار التطبيق القديم باستخدام كود الالتزام الأساسي الفعلي `70b4027` (112 اختباراً ناجحاً في CI دون أي تخطٍ أو فشل). |
 
 ---
 
@@ -49,7 +49,7 @@
   - `metadata.st_uid == 10001 and metadata.st_gid == 10001` يتحقق بنجاح.
   - `file_mode in {0o400, 0o440}` يتحقق بنجاح.
 
-### 4. الإثبات العملي من تشغيل CI (`43492784228`)
+### 4. الإثبات العملي من تشغيل CI (`43496356039`)
 تم تشغيل فحص مباشر داخل الحاوية المعزولة بصلاحيات `10001:10001` للتأكد من قدرة محمل الأسرار على فتح الملفين من المجلد `0750`:
 ```text
 Testing secret loader resolution inside container as user 10001:10001...
@@ -158,7 +158,7 @@ assert "OPENROUTER_API_KEY_FILE" in names, "FAIL: OPENROUTER_API_KEY_FILE missin
 '
 ```
 
-### الناتج الفعلي المثبت في CI (`43492784228`):
+### الناتج الفعلي المثبت في CI (`43496356039`):
 ```text
 GATEWAY_PEPPER_DIRECT=ABSENT
 OPENROUTER_API_KEY_DIRECT=ABSENT
@@ -215,21 +215,45 @@ volumes:
 *(تمت إزالة `GATEWAY_PEPPER=${GATEWAY_PEPPER}` نهائياً، وفرض القراءة فقط، ونظام tmpfs، وتركيب الأسرار بـ `:ro`).*
 
 ### 2. تحديث [scripts/backup.sh](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/scripts/backup.sh)
-تم تحديث السكربت ليدعم الحاويات المشغلة بـ `docker run` (مثل `ai-gateway-v1` أو `ai-gateway-v1-production`) و Compose دون افتراض مسبق:
+تم تحديث السكربت بالكامل ليعزل النسخة الاحتياطية على المضيف خارج الـ Volume، مع إزالة خيار `-T` غير الصالح من `docker exec`، واعتماد الاستخراج بالتدفق المباشر (`cat > "$DEST"`) لدعم الحاويات المقيدة ذات الـ `--tmpfs /tmp`، وفحص سلامة النسخة على المضيف:
 ```sh
 #!/bin/sh
 set -eu
 
-DEST="${1:-/data/backups/backup-$(date +%Y%m%d%H%M%S).sqlite3}"
+# Target backup file on the HOST (outside the container volume)
+TIMESTAMP="$(date +%Y%m%d%H%M%S)"
+HOST_BACKUP_DIR="${HOST_BACKUP_DIR:-./backups}"
+DEST="${1:-${HOST_BACKUP_DIR}/backup-${TIMESTAMP}.sqlite3}"
+
+mkdir -p "$(dirname "$DEST")"
 
 if command -v docker >/dev/null 2>&1 && docker compose ps --services 2>/dev/null | grep -q gateway; then
-    docker compose exec -T gateway python -m app.admin backup "$DEST"
-elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '^(ai-gateway-v1|gateway|ai-gateway-v1-production)$'; then
-    CONTAINER_NAME="$(docker ps --format '{{.Names}}' | grep -m1 -E '^(ai-gateway-v1|gateway|ai-gateway-v1-production)$')"
-    docker exec -T "$CONTAINER_NAME" python -m app.admin backup "$DEST"
+    # Mode 1: Docker Compose (uses -T)
+    CONTAINER_TEMP="/tmp/online-backup-${TIMESTAMP}.sqlite3"
+    docker compose exec -T gateway python -m app.admin backup "$CONTAINER_TEMP"
+    docker compose exec -T gateway cat "$CONTAINER_TEMP" > "$DEST"
+    chmod 0600 "$DEST"
+    [ -s "$DEST" ] || { echo "ERROR: Backup empty" && exit 1; }
+    sqlite3 "$DEST" "PRAGMA integrity_check;"
+    docker compose exec -T gateway rm -f "$CONTAINER_TEMP"
+elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '^(ai-gateway-v1|gateway|ai-gateway-v1-production|ai-gateway-v1-phase-d-candidate)$'; then
+    # Mode 2: Docker Run (standalone container - WITHOUT -T)
+    CONTAINER_NAME="$(docker ps --format '{{.Names}}' | grep -m1 -E '^(ai-gateway-v1|gateway|ai-gateway-v1-production|ai-gateway-v1-phase-d-candidate)$')"
+    CONTAINER_TEMP="/tmp/online-backup-${TIMESTAMP}.sqlite3"
+    docker exec "$CONTAINER_NAME" python -m app.admin backup "$CONTAINER_TEMP"
+    docker exec "$CONTAINER_NAME" cat "$CONTAINER_TEMP" > "$DEST"
+    chmod 0600 "$DEST"
+    [ -s "$DEST" ] || { echo "ERROR: Backup empty" && exit 1; }
+    sqlite3 "$DEST" "PRAGMA integrity_check;"
+    docker exec "$CONTAINER_NAME" rm -f "$CONTAINER_TEMP"
 else
+    # Mode 3: Local Bare-Metal
     python -m app.admin backup "$DEST"
+    chmod 0600 "$DEST" 2>/dev/null || true
+    sqlite3 "$DEST" "PRAGMA integrity_check;"
 fi
+
+sha256sum "$DEST"
 ```
 
 ---
@@ -238,10 +262,10 @@ fi
 
 ### 1. التمييز الحاسم بين صورة CI وصورة إعادة البناء
 - **صورة CI المختبرة:**
-  - البناء في CI Runner ينتج معرفاً فريداً (`sha256:18c76303a78d35142ad05e02308ae58e318dc20d6d7b6db5150baaa3a593a439`).
+  - البناء في CI Runner ينتج معرفاً فريداً (`sha256:879e05c8994d8a6af0dece2059594cacfde9184e64353693edf701a93e5581dc`).
   - هذا المعرف يعتمد على بيئة البناء وتوقيتات الطبقات، ولا يمكن افتراض تطابقه المسبق مع أي إعادة بناء محلية على خادم الإنتاج.
 - **إعادة البناء على خادم الإنتاج:**
-  - عند البناء من الالتزام `8e987a0` على خادم الإنتاج:
+  - عند البناء من الالتزام المعتمد `2ebc857` على خادم الإنتاج:
     `docker build --no-cache -t ai-gateway-v1:candidate-production .`
   - **الإجراء الإلزامي:** يجب قياس وتسجيل الـ `Image ID` الفعلي الناتج على الخادم فور اكتمال البناء:
     `PROD_IMAGE_ID=$(docker inspect --format '{{.Id}}' ai-gateway-v1:candidate-production)`
@@ -319,7 +343,7 @@ fi
 3. اعتماد فحص بيئة الحاوية الآمن دون أي تسريب لقيم الأسرار في السجلات.
 4. تحديث `docker-compose.yml` و`scripts/backup.sh` لتتوافق مع قيود الأمان والتشغيل الفعلي.
 5. إثبات التوافق العكسي التام لـ SQLite بنسبة 100% في حال التراجع.
-6. اجتياز 104 اختبارات كاملة على Linux في CI بنجاح تام وبدون أي اختبار متخطٍ أو فاشل.
+6. اجتياز 112 اختباراً كاملاً على Linux في CI بنجاح تام وبدون أي اختبار متخطٍ أو فاشل (Run ID: `43496356039`).
 
 **القرار النهائي:**
 ### `READY FOR OWNER CUTOVER APPROVAL`
