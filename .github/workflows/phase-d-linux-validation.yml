@@ -251,13 +251,14 @@ jobs:
         run: |
           echo "=== TESTING CANDIDATE CONTAINER IN STRICT ISOLATION ==="
           
-          # Setup mock secrets directory with ownership 10001:10001 and mode 0400
+          # Setup mock secrets directory with ownership root:10001 and mode 0750
           MOCK_SECRETS_DIR="/tmp/phase-d-mock-secrets"
-          mkdir -p "${MOCK_SECRETS_DIR}"
-          echo -n "test-pepper-synthetic-at-least-32-chars-long" > "${MOCK_SECRETS_DIR}/pepper"
-          echo -n "mock-openrouter-secret-token" > "${MOCK_SECRETS_DIR}/openrouter_key"
-          sudo chown -R 10001:10001 "${MOCK_SECRETS_DIR}"
-          sudo chmod 0700 "${MOCK_SECRETS_DIR}"
+          sudo mkdir -p "${MOCK_SECRETS_DIR}"
+          echo -n "test-pepper-synthetic-at-least-32-chars-long" | sudo tee "${MOCK_SECRETS_DIR}/pepper" > /dev/null
+          echo -n "mock-openrouter-secret-token" | sudo tee "${MOCK_SECRETS_DIR}/openrouter_key" > /dev/null
+          sudo chown root:10001 "${MOCK_SECRETS_DIR}"
+          sudo chmod 0750 "${MOCK_SECRETS_DIR}"
+          sudo chown 10001:10001 "${MOCK_SECRETS_DIR}/pepper" "${MOCK_SECRETS_DIR}/openrouter_key"
           sudo chmod 0400 "${MOCK_SECRETS_DIR}/pepper" "${MOCK_SECRETS_DIR}/openrouter_key"
 
           # Setup mock config
@@ -311,14 +312,33 @@ jobs:
             exit 1
           fi
 
-          # Verify Docker Config.Env does not contain literal secrets
-          CONTAINER_ENV=$(docker inspect ai-gateway-v1-phase-d-candidate --format '{{json .Config.Env}}')
-          echo "Inspecting container env vars (safe check):"
-          echo "${CONTAINER_ENV}" | grep -v "mock-openrouter-secret-token" | grep -v "test-pepper-synthetic"
-          if echo "${CONTAINER_ENV}" | grep -q "mock-openrouter-secret-token"; then
-            echo "FAIL: Literal secret found in Docker Config.Env!" && exit 1
-          fi
+          # Verify Docker Config.Env variables safely without ever printing values:
+          echo "Inspecting container environment variable names safely:"
+          docker inspect ai-gateway-v1-phase-d-candidate --format '{{json .Config.Env}}' | python3 -c '
+          import sys, json
+          env_list = json.load(sys.stdin)
+          names = [e.split("=", 1)[0] for e in env_list if "=" in e]
+          print("GATEWAY_PEPPER_DIRECT=" + ("PRESENT" if "GATEWAY_PEPPER" in names else "ABSENT"))
+          print("OPENROUTER_API_KEY_DIRECT=" + ("PRESENT" if "OPENROUTER_API_KEY" in names else "ABSENT"))
+          print("GATEWAY_PEPPER_FILE=" + ("PRESENT" if "GATEWAY_PEPPER_FILE" in names else "ABSENT"))
+          print("OPENROUTER_API_KEY_FILE=" + ("PRESENT" if "OPENROUTER_API_KEY_FILE" in names else "ABSENT"))
+          assert "GATEWAY_PEPPER" not in names, "GATEWAY_PEPPER must not be passed directly"
+          assert "OPENROUTER_API_KEY" not in names, "OPENROUTER_API_KEY must not be passed directly"
+          assert "GATEWAY_PEPPER_FILE" in names, "GATEWAY_PEPPER_FILE missing"
+          assert "OPENROUTER_API_KEY_FILE" in names, "OPENROUTER_API_KEY_FILE missing"
+          '
           echo "PASS: Zero literal secrets in Docker Config.Env (uses _FILE paths only)"
+
+          # Test secret loader directly inside container as UID 10001:10001
+          echo "Testing secret loader resolution inside container as user 10001:10001..."
+          docker exec -i ai-gateway-v1-phase-d-candidate python -c '
+          from app.secret_loader import resolve_secret
+          p = resolve_secret("GATEWAY_PEPPER")
+          assert len(p) >= 32
+          k = resolve_secret("OPENROUTER_API_KEY")
+          assert len(k) > 0
+          print("PASS: Secrets opened and resolved successfully by UID 10001:10001 from 0750 parent directory")
+          '
 
           # Test admin CLI inside container to create key
           echo "Creating client key inside container..."

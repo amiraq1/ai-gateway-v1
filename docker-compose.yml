@@ -3,8 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ai-gateway-v1:local
+    image: ai-gateway-v1:candidate-4d95c42
     restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
     ports:
       - "127.0.0.1:8000:8000"
     environment:
@@ -12,14 +14,23 @@ services:
       - GATEWAY_PORT=8000
       - GATEWAY_CONFIG=/app/config/config.yaml
       - GATEWAY_DATABASE_PATH=/data/gateway.sqlite3
-      - GATEWAY_PEPPER=${GATEWAY_PEPPER}
+      - GATEWAY_PEPPER_FILE=/secrets/pepper
+      - OPENROUTER_API_KEY_FILE=/secrets/openrouter_key
     volumes:
       - ai-gateway-v1-data:/data
       - ./config/config.yaml:/app/config/config.yaml:ro
+      - /etc/ai-gateway/secrets:/secrets:ro
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=0700
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
 volumes:
   ai-gateway-v1-data:
