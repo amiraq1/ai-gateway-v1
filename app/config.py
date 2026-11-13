@@ -58,56 +58,76 @@ DISALLOWED_KEY_ENVS = frozenset({
     "SYSTEMROOT", "WINDIR", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH",
 })
 
-ALLOWED_KEY_PREFIXES = (
-    "PROVIDER_", "OPENAI_", "ANTHROPIC_", "COHERE_", "MISTRAL_",
-    "GROQ_", "DEEPSEEK_", "AZURE_", "TEST_",
-)
+APPROVED_PROVIDER_KEY_ENVS = frozenset({
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "COHERE_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "TEST_PRIMARY_KEY",
+    "TEST_SECONDARY_KEY",
+    "TEST_PROVIDER_API_KEY",
+    "MOCK_PROVIDER_API_KEY",
+    "TEST_KEY",
+})
+
+PROVIDER_KEY_ENV_MAP: dict[str, frozenset[str]] = {
+    "openai": frozenset({"OPENAI_API_KEY"}),
+    "anthropic": frozenset({"ANTHROPIC_API_KEY"}),
+    "openrouter": frozenset({"OPENROUTER_API_KEY"}),
+    "deepseek": frozenset({"DEEPSEEK_API_KEY"}),
+    "groq": frozenset({"GROQ_API_KEY"}),
+    "mistral": frozenset({"MISTRAL_API_KEY"}),
+    "cohere": frozenset({"COHERE_API_KEY"}),
+    "azure": frozenset({"AZURE_OPENAI_API_KEY"}),
+    "primary": frozenset({"TEST_PRIMARY_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "TEST_PROVIDER_API_KEY"}),
+    "secondary": frozenset({"TEST_SECONDARY_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "TEST_PROVIDER_API_KEY"}),
+    "fallback": frozenset({"TEST_SECONDARY_KEY", "OPENROUTER_API_KEY", "TEST_PROVIDER_API_KEY", "MOCK_PROVIDER_API_KEY"}),
+    "mock": frozenset({"MOCK_PROVIDER_API_KEY", "TEST_PROVIDER_API_KEY"}),
+    "test": frozenset({"TEST_PROVIDER_API_KEY", "MOCK_PROVIDER_API_KEY", "TEST_PRIMARY_KEY", "TEST_SECONDARY_KEY", "TEST_KEY"}),
+}
 
 
-def validate_provider_key_env(env_name: str, allowed_list: set[str] | None = None) -> str:
+def validate_provider_key_env(
+    env_name: str,
+    provider_name: str | None = None,
+    allowed_list: frozenset[str] | set[str] | None = None,
+) -> str:
     cleaned = env_name.strip()
     upper = cleaned.upper()
-    if upper.startswith("GATEWAY_") or upper in DISALLOWED_KEY_ENVS:
-        raise ValueError(f"Environment variable {env_name!r} is not an allowed provider key environment variable (internal/system variable)")
-    if allowed_list is not None and upper not in allowed_list:
-        raise ValueError(f"Environment variable {env_name!r} is not in the allowed provider key list")
-    if allowed_list is None and not any(upper.startswith(prefix) for prefix in ALLOWED_KEY_PREFIXES):
-        raise ValueError(f"Environment variable {env_name!r} is not an allowed provider key environment variable (must start with standard provider prefix or be explicitly allowlisted)")
+    base_name = upper[:-5] if upper.endswith("_FILE") else upper
+
+    if base_name.startswith("GATEWAY_") or base_name in DISALLOWED_KEY_ENVS:
+        raise ValueError(
+            f"Environment variable {env_name!r} is not an allowed provider key environment variable (internal/system variable)"
+        )
+
+    effective_allowlist = allowed_list if allowed_list is not None else APPROVED_PROVIDER_KEY_ENVS
+    if base_name not in effective_allowlist:
+        raise ValueError(
+            f"Environment variable {env_name!r} is not in the approved provider key allowlist (must be explicitly approved)"
+        )
+
+    if provider_name:
+        prov_key = provider_name.strip().lower()
+        if prov_key in PROVIDER_KEY_ENV_MAP:
+            allowed_for_prov = PROVIDER_KEY_ENV_MAP[prov_key]
+            if base_name not in allowed_for_prov:
+                raise ValueError(
+                    f"Environment variable {env_name!r} is not permitted for provider {provider_name!r}"
+                )
+
     return cleaned
 
 
-def _is_forbidden_target(hostname: str) -> bool:
-    lower = hostname.lower()
-    if lower in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or lower.endswith(".localhost"):
-        return True
-    try:
-        ip = ipaddress.ip_address(hostname)
-        return (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or str(ip).startswith("169.254.")
-        )
-    except ValueError:
-        return False
+from .ssrf import validate_ssrf_url, is_ip_forbidden
 
 
 def _validate_api_base(value: str, provider_name: str, allow_insecure_http: bool = False) -> str:
-    parts = urlsplit(value)
-    if parts.scheme not in {"https", "http"} or not parts.netloc:
-        raise ValueError(f"Provider {provider_name!r} api_base must be an absolute URL")
-    if parts.scheme == "http" and not allow_insecure_http:
-        raise ValueError(f"Provider {provider_name!r} api_base must use HTTPS")
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError(f"Provider {provider_name!r} api_base cannot contain credentials, query, or fragment")
-
-    hostname = parts.hostname or ""
-    if not hostname or _is_forbidden_target(hostname):
-        raise ValueError(f"Provider {provider_name!r} api_base violates SSRF protection: target {hostname!r} is a forbidden internal, private, loopback, or link-local address")
-
-    return value.rstrip("/")
+    return validate_ssrf_url(value, provider_name)
 
 
 def load_config(path: str | Path | None = None) -> GatewayConfig:
@@ -149,7 +169,7 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
             key_env = str(item.get("api_key_env", "")).strip()
             if not name or not model_id or not key_env or not key_env.replace("_", "").isalnum():
                 raise ValueError(f"Provider for {alias!r} requires name, model, and api_key_env")
-            key_env = validate_provider_key_env(key_env)
+            key_env = validate_provider_key_env(key_env, provider_name=name)
             api_base = _validate_api_base(str(item.get("api_base", "")), name)
             providers.append(ProviderConfig(name, model_id, api_base, key_env, bool(item.get("enabled", True))))
         models[alias] = ModelConfig(alias, bool(entry.get("enabled", True)), tuple(providers))

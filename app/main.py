@@ -16,6 +16,7 @@ from .database import Database
 from .models import ChatCompletionRequest, provider_payload
 from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, _headers, complete
 from .secret_loader import SecretLoadError, resolve_secret
+from .ssrf import create_safe_transport
 
 
 class BoundedBodyMiddleware:
@@ -180,7 +181,8 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             event_size = 0
             saw_done = False
             try:
-                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=transport, follow_redirects=False) as http:
+                client_transport = transport if transport is not None else create_safe_transport()
+                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=client_transport, follow_redirects=False, trust_env=False) as http:
                     async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider)) as response:
                         if response.status_code in RETRYABLE_STATUS:
                             await response.aread()

@@ -7,6 +7,7 @@ import httpx
 
 from .config import ProviderConfig, validate_provider_key_env
 from .secret_loader import SecretLoadError, resolve_secret
+from .ssrf import create_safe_transport
 
 RETRYABLE_STATUS = {429, *range(500, 600)}
 MAX_ATTEMPTS = 2
@@ -27,7 +28,7 @@ def _url(provider: ProviderConfig) -> str:
 
 def _headers(provider: ProviderConfig) -> dict[str, str]:
     try:
-        validate_provider_key_env(provider.api_key_env)
+        validate_provider_key_env(provider.api_key_env, provider_name=provider.name)
     except ValueError:
         raise ProviderFailure("provider_secret_unavailable", 503, False) from None
     try:
@@ -51,7 +52,8 @@ async def complete(providers: list[ProviderConfig], payload: dict[str, Any], tim
         body["model"] = provider.model
         try:
             body_bytes = bytearray()
-            async with httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False) as client:
+            client_transport = transport if transport is not None else create_safe_transport()
+            async with httpx.AsyncClient(timeout=timeout, transport=client_transport, follow_redirects=False, trust_env=False) as client:
                 async with client.stream("POST", _url(provider), headers=_headers(provider), json=body) as response:
                     if response.status_code in RETRYABLE_STATUS:
                         await response.aread()
