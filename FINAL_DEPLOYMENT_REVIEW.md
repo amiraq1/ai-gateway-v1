@@ -1,312 +1,315 @@
-# AI Gateway V1 — Final Deployment Review
+# AI Gateway V1 — Final Deployment Review (Corrected & Verified)
 
 **التاريخ:** 13 نوفمبر 2026  
 **الفرع المعتمد للمراجعة:** `audit/2026-11-13-c1`  
+**الالتزام المعتمد والمختبر في CI:** `8e987a0`  
 **الالتزام الأساسي:** `f98c189`  
-**الالتزام المعتمد والمختبر في CI:** `4d95c42`  
-**التزام التوثيق الحالي (HEAD):** `644a7a5`  
-**معرف تشغيل التحقق في GitHub Actions:** `43485604249`  
-**معرف الصورة المرشحة (Candidate Image ID):** `sha256:2669c6e366535796ec0420f0139f83eab59ef60a81d0a3aa2505da1568d61fe7`  
-**القرار النهائي:** `READY FOR OWNER CUTOVER APPROVAL`
+**معرف تشغيل التحقق المستقل في GitHub Actions:** `43492784228`  
+**معرف الصورة المرشحة في CI:** `sha256:18c76303a78d35142ad05e02308ae58e318dc20d6d7b6db5150baaa3a593a439`  
+**القرار النهائي:** `READY FOR OWNER CUTOVER APPROVAL` (نافذة التبديل معلقة بانتظار موافقة المالك)
 
 ---
 
-## 1. جدول التقييم التنفيذي لمعايير النشر
+## 1. جدول التقييم التنفيذي لمعايير النشر بعد التصحيحات
 
-| المعيار | التقييم | الملاحظات والأدلة |
+| المعيار | التقييم | النتيجة الفنية والضوابط المعتمدة |
 | :--- | :---: | :--- |
-| **A. اعتماد مصدر الصورة وتطابق الكود** | **PASS** | الكود البرمجي في HEAD مطابق تماماً لـ `4d95c42` بنسبة 100%، وتم إثبات عدم تغيير أي سطر تطبيقي. |
-| **B. مراجعة إعدادات التشغيل والحاوية** | **PASS** | تم تحديد الفروق بين الإعداد القديم والمرشح، وفرض عزل الذاكرة ونظام الملفات للقراءة فقط. |
-| **C. خطة نقل الأسرار وحفظ الـ Pepper** | **PASS** | تصميم إجراء نقل بايت ببايت يمنع إبطال مفاتيح العملاء، واستبعاد الأسرار تماماً من `Config.Env`. |
-| **D. خطة النسخ الاحتياطي وتوافق SQLite** | **PASS** | التحقق من التوافق العكسي لمخطط SQLite (Version 1)، وتصميم آلية Online Backup بـ `integrity_check`. |
-| **E. تسلسل Cutover وشروط التراجع** | **PASS** | خطوات تشغيلية محددة تمنع تشغيل نسختين على نفس الحجم وتحدد معايير Rollback الفورية. |
-| **جاهزية الإنتاج التقنية** | **PASS** | صفر منافذ مفتوحة محلياً، لا مساس ببيئة الإنتاج، واجتياز 103 اختبارات Linux بنجاح تام. |
+| **1. صلاحيات مجلد وملفات الأسرار** | **PASS** | تصحيح المجلد لـ `0750` بملكية `root:10001`، والملفات `0400` بملكية `10001:10001`. تم إثبات نجاح فتح الملفين فعلياً بهوية `10001:10001` داخل الحاوية المرشحة. |
+| **2. بروتوكول نقل Pepper المطابق بايتاً ببايت** | **PASS** | إلغاء أمر `tr -d` القديم بالكامل؛ اعتماد استخراج البايتات الخام (`os.environb`) دون تطبيع، مع مطابقة `sha256` المستقلة، وفحص التكافؤ الوظيفي لـ HMAC. |
+| **3. فحص Docker Config.Env دون كشف الأسرار** | **PASS** | استبدال `grep` بأمر فحص آمن يطبع أسماء المتغيرات فقط (`GATEWAY_PEPPER_DIRECT=ABSENT`، `GATEWAY_PEPPER_FILE=PRESENT`) دون أي إخراج لقيم أو JSON. |
+| **4. تحديث إعداد Compose وسكربت النسخ الاحتياطي** | **PASS** | تحديث `docker-compose.yml` ليعتمد `*_FILE` و `--read-only` وحدود الموارد؛ وتحديث `scripts/backup.sh` ليدعم الحاويات المشغلة بـ `docker run` و Compose. |
+| **5. توثيق هوية الصورة ونقلها** | **PASS** | توثيق الفرق بين Image ID في CI وإعادة البناء على الإنتاج؛ واشتراط قياس Image ID وفحص الصورة قبل التبديل، أو استخدام `docker save/load` كأثر منقول. |
+| **6. اختبار التوافق العكسي لـ SQLite والتراجع** | **PASS** | إنجاز اختبار مستقل شامل ([test_sqlite_backward_compatibility.py](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/tests/test_sqlite_backward_compatibility.py))؛ أثبت سلامة الترحيل وعدم فقدان أي بيانات عند التراجع لإصدار التطبيق القديم (104 اختبارات ناجحة في CI). |
 
 ---
 
-## 2. البند A: اعتماد مصدر الصورة (Image Source Verification)
+## 2. البند 1: صلاحيات مجلد وملفات الأسرار (Secret Directory Permissions)
 
-### 1. الالتزام المصدري (Git SHA)
-- **الالتزام الذي بُنيت منه الصورة واختُبرت في CI:**  
-  `4d95c423d7be34f2d80d28747a06d0ba416c11fc` (`4d95c42`)  
-  *رسالة الإيداع:* `ci: fix client_id extraction and revoke assertion in container isolation step`
-- **مقارنة الالتزام المختبر مع HEAD الحالي (`644a7a5`):**  
-  تم إجراء فحص فوارق دقيق عبر:
-  ```bash
-  git diff 4d95c42..HEAD --stat
-  git diff 4d95c42..HEAD -- app/ config/ Dockerfile requirements.lock .dockerignore
-  ```
-  **الدليل القاطع:** ناتج فحص مجلدات التطبيق والإعدادات وملفات البناء **فارغ تماماً (Zero Diff)**. التغيير الوحيد بين `4d95c42` و `HEAD` هو إضافة ملف التوثيق [PHASE_D_LINUX_CI_VALIDATION.md](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/PHASE_D_LINUX_CI_VALIDATION.md).
+### 1. تحليل المشكلة المعالجة
+كان المقترح السابق يضبط المجلد `/etc/ai-gateway/secrets` بالصلاحية `0700` وبملكية `root:root`. وبما أن الحاوية تعمل بالمستخدم `10001:10001`، فإن هذا الإعداد يمنع المستخدم `10001` من عبور المجلد (Traverse / Search) للحصول على مفاتيحه، مما يؤدي إلى فشل فوري في تشغيل البوابة وتوقف تحميل الأسرار.
 
-### 2. هوية الصورة وبصمتها (Image ID & Digest)
-- **اسم الوسم المرشح في CI:** `ai-gateway-v1:phase-d-linux-candidate`
-- **معرف الصورة (Image ID):**  
-  `sha256:2669c6e366535796ec0420f0139f83eab59ef60a81d0a3aa2505da1568d61fe7`
-- **حجم الصورة:** `144,697,595 bytes` (~137.99 MB).
-- **المستخدم الافتراضي داخل الصورة:** `10001:10001` (gateway non-root).
+### 2. التصميم المصحح والمعتمد
+- **المجلد على المضيف:**
+  - المسار: `/etc/ai-gateway/secrets`
+  - المالك: `root:10001`
+  - الصلاحية: `0750` (`rwxr-x---`)
+- **ملفات الأسرار داخل المجلد:**
+  - المسارات: `/etc/ai-gateway/secrets/pepper` و `/etc/ai-gateway/secrets/openrouter_key`
+  - المالك: `10001:10001`
+  - الصلاحية: `0400` (`r--------`)
+- **التركيب داخل الحاوية:**
+  - `-v /etc/ai-gateway/secrets:/secrets:ro`
 
-### 3. نقل الصورة إلى خادم الإنتاج وإعادة البناء الحتمي
-الصورة التي بُنيت في بيئة GitHub Actions Runner لا تنتقل تلقائياً إلى خادم الإنتاج. ولضمان عدم الاعتماد على وسوم مجهولة المصدر:
-- **إجراء إعادة البناء الحتمي على خادم الإنتاج:**
-  ```bash
-  # 1. جلب الالتزام المعتمد
-  git fetch origin audit/2026-11-13-c1
-  git checkout 4d95c42
+### 3. التوافق التام مع سياسة `app/secret_loader.py`
+- مجلد `/secrets` يمتلكه `root` (UID 0) ومجموعته `10001` (GID 10001):
+  - `SAFE_DIRECTORY_UIDS = frozenset({0, 10001})` يتحقق بنجاح لأن المالك `0`.
+  - شرط الأمان `mode & 0o022 == 0` يتحقق بنجاح لأن `0o750 & 0o022 == 0` (لا توجد صلاحية كتابة للمجموعة أو الآخرين).
+  - المستخدم `10001` يمتلك صلاحية العبور `r-x` عبر انتمائه لمجموعة المجلد `10001`.
+- ملفات الأسرار يمتلكها `10001:10001` وصلاحيتها `0400`:
+  - `metadata.st_uid == 10001 and metadata.st_gid == 10001` يتحقق بنجاح.
+  - `file_mode in {0o400, 0o440}` يتحقق بنجاح.
 
-  # 2. بناء الصورة محلياً على خادم الإنتاج دون الاعتماد على الكاش
-  docker build --no-cache -t ai-gateway-v1:candidate-4d95c42 .
-
-  # 3. التحقق من هوية الصورة والمستخدم
-  IMAGE_ID=$(docker inspect ai-gateway-v1:candidate-4d95c42 --format '{{.Id}}')
-  USER_ID=$(docker inspect ai-gateway-v1:candidate-4d95c42 --format '{{.Config.User}}')
-  echo "Built Image ID: $IMAGE_ID"
-  echo "Image User: $USER_ID"
-  ```
-- **حظر قطعي:** عدم تعديل أو استبدال الصورة القديمة `ai-gateway-v1:local` حتى صدور قرار المالك الرسمي.
-
----
-
-## 3. البند B: مراجعة إعداد التشغيل الفعلي (Runtime Configuration Review)
-
-تمت مقارنة معايير تشغيل الحاوية القديمة مقابل معايير الحاوية المرشحة للنشر:
-
-| خاصية التشغيل | الحاوية الحالية (Baseline) | الحاوية المرشحة (Candidate) | التقييم الأمني والتشغيلي |
-| :--- | :--- | :--- | :--- |
-| **Image ID** | مبنية من `70b4027` | `sha256:2669c6e366...` (من `4d95c42`) | **ترقية إلزامية** لإغلاق الثغرات |
-| **Port Binding** | `127.0.0.1:8000:8000` | `127.0.0.1:8000:8000` | **مطابق وصارم** (منع التعرض لـ LAN) |
-| **Network Mode** | Docker Bridge افتراضي | Docker Bridge مخصص ومقيد | **تحسين** لعزل شبكة الحاوية |
-| **Restart Policy** | `unless-stopped` | `unless-stopped` | **مطابق** لاستقرار الخدمة |
-| **User** | `10001:10001` | `10001:10001` | **مطابق** (Non-root user) |
-| **ReadonlyRootfs** | `false` (نظام ملفات قابل للكتابة) | `true` (`--read-only`) | **ترقية أمنية جوهرية** لمنع التعديل |
-| **Capabilities** | غير محددة أو جزئية | `CapDrop: ["ALL"]` | **ترقية أمنية** لإسقاط كامل الصلاحيات |
-| **NoNewPrivileges** | `true` | `true` | **مطابق** لمنع تصعيد الصلاحيات |
-| **Resource Limits** | غير محددة (خطر استنزاف الذاكرة) | `memory: 512m`, `cpus: 1.0`, `pids: 100` | **ترقية استقرار** لمنع DoS على المضيف |
-| **Data Mount** | `ai-gateway-v1-data:/data` | `ai-gateway-v1-data:/data` | **مطابق** للحفاظ على قاعدة البيانات |
-| **tmpfs Mounts** | غير موجودة | `/tmp` (`mode=0700,uid=10001`) | **إلزامي** لتمكين `--read-only` |
-| **Secrets Exposure** | محقونة في `Config.Env` | ملفات `:ro` بصلاحيات `0400` | **ترقية أمنية حرجة** (F-002) |
-
-### أمر فحص metadata الحاوية الحالية على خادم الإنتاج (دون كشف الأسرار):
-```bash
-docker inspect <CURRENT_CONTAINER_ID> --format '
-Image: {{.Image}}
-Ports: {{json .HostConfig.PortBindings}}
-NetworkMode: {{.HostConfig.NetworkMode}}
-RestartPolicy: {{json .HostConfig.RestartPolicy}}
-User: {{.Config.User}}
-ReadonlyRootfs: {{.HostConfig.ReadonlyRootfs}}
-CapDrop: {{json .HostConfig.CapDrop}}
-SecurityOpt: {{json .HostConfig.SecurityOpt}}
-Memory: {{.HostConfig.Memory}}
-NanoCpus: {{.HostConfig.NanoCPUs}}
-PidsLimit: {{.HostConfig.PidsLimit}}
-Mounts: {{json .Mounts}}
-'
+### 4. الإثبات العملي من تشغيل CI (`43492784228`)
+تم تشغيل فحص مباشر داخل الحاوية المعزولة بصلاحيات `10001:10001` للتأكد من قدرة محمل الأسرار على فتح الملفين من المجلد `0750`:
+```text
+Testing secret loader resolution inside container as user 10001:10001...
+PASS: Secrets opened and resolved successfully by UID 10001:10001 from 0750 parent directory
 ```
-*(ملاحظة أمنية: تم استبعاد `Config.Env` من صيغة الأمر لمنع تسريب الأسرار إلى الشاشة أو السجلات).*
 
 ---
 
-## 4. البند C: خطة نقل الأسرار (Secret Migration Plan)
+## 3. البند 2: بروتوكول نقل Pepper الدقيق بايتاً ببايت (Pepper Exact Migration Protocol)
 
-لضمان استمرار عمل جميع مفاتيح العملاء الحالية دون انقطاع وتفادي رفض الطلبات بـ `401 Unauthorized`، تم تصميم الإجراء التالي لنقل سر Pepper ومفتاح OpenRouter:
-
-### 1. نقل Pepper الإنتاجي بايتاً ببايت (Byte-for-Byte Integrity)
-إن إضافة أي رمز غير مرئي مثل سطر جديد (`\n` أو `\r\n`) أو مسافة سيغير تجزئة HMAC بالكامل ويُبطل مفاتيح العملاء الحالية فورياً:
+### 1. إبطال طريقة الاستخراج القديمة
+تم إلغاء الأمر السابق:
 ```bash
-# إنشاء مجلد الأسرار المحمي على خادم المضيف
-sudo mkdir -p /etc/ai-gateway/secrets
-sudo chmod 0700 /etc/ai-gateway/secrets
+# ملغى ومحرم استخدامه:
+grep '^GATEWAY_PEPPER=' ... | cut -d'=' -f2- | tr -d '\r\n'
+```
+**سبب الإلغاء:** الأمر `tr -d '\r\n'` يقوم بحذف أي محرف نهاية سطر في كامل النص بشكل عشوائي، كما أن مقارنة التجزئة لنفس النص المعالج لا تثبت أن بايتات القيمة الأصلية قبل المعالجة مطابقة للبايتات بعد النقل.
 
-# استخراج القيمة الحالية من ملف .env الحالي بدقة تامة وبدون سطر إضافي:
-grep '^GATEWAY_PEPPER=' /path/to/prod/.env | cut -d'=' -f2- | tr -d '\r\n' | sudo tee /etc/ai-gateway/secrets/pepper > /dev/null
+### 2. بروتوكول النقل الخام المعتمد (Zero Normalization Protocol)
+تُنقل القيمة الفعلية كما تقرؤها العملية الحالية في ذاكرتها من `os.environb` مباشرة، دون تعديل أو تطبيع، ودون تمريرها في arguments، ودون حفظها في shell history:
 
-# ضبط الملكية والصلاحيات الصارمة لـ UID 10001
-sudo chown 10001:10001 /etc/ai-gateway/secrets/pepper
-sudo chmod 0400 /etc/ai-gateway/secrets/pepper
+```bash
+# 1. إنشاء المجلد المحمي على المضيف
+sudo install -m 0750 -o root -g 10001 -d /etc/ai-gateway/secrets
 
-# التحقق من التطابق التام عبر مقارنة بصمة sha256 دون طباعة السر:
-SRC_HASH=$(grep '^GATEWAY_PEPPER=' /path/to/prod/.env | cut -d'=' -f2- | tr -d '\r\n' | sha256sum | awk '{print $1}')
-DST_HASH=$(sudo sha256sum /etc/ai-gateway/secrets/pepper | awk '{print $1}')
-if [ "$SRC_HASH" != "$DST_HASH" ]; then
-    echo "ERROR: Pepper hash mismatch! Aborting." && exit 1
+# 2. إنشاء الملف الهدف فارغاً بصلاحيات 0400 فوراً قبل استقبال البيانات
+sudo install -m 0400 -o 10001 -g 10001 /dev/null /etc/ai-gateway/secrets/pepper
+
+# 3. استخراج البايتات الخام مباشرة من ذاكرة العملية الحالية عبر pipe إلى الملف المحمي:
+docker exec -i <CURRENT_CONTAINER_ID> python -c '
+import os, sys
+raw_bytes = os.environb.get(b"GATEWAY_PEPPER")
+if not raw_bytes or len(raw_bytes) < 32:
+    sys.exit("ABORT: GATEWAY_PEPPER is missing or less than 32 bytes")
+# شرط التوقف الصارم: إذا وُجدت فواصل أسطر داخلية ملتبسة في البيئة، توقف فوراً ولا تغير شيئاً
+if b"\n" in raw_bytes or b"\r" in raw_bytes:
+    sys.exit("ABORT: In-memory Pepper contains line breaks; stopping to prevent key corruption")
+sys.stdout.buffer.write(raw_bytes)
+' | sudo tee /etc/ai-gateway/secrets/pepper > /dev/null
+```
+
+### 3. إثبات التكافؤ عبر بصمة SHA-256 المستقلة
+يتم حساب بصمة التجزئة للمصدر (ذاكرة العملية الحالية) ومقارنتها ببصمة الملف المنقول بشكل مستقل تماماً ودون طباعة السر:
+```bash
+SRC_SHA=$(docker exec -i <CURRENT_CONTAINER_ID> python -c '
+import os, hashlib, sys
+raw = os.environb.get(b"GATEWAY_PEPPER", b"")
+sys.stdout.write(hashlib.sha256(raw).hexdigest())
+')
+
+DST_SHA=$(sudo sha256sum /etc/ai-gateway/secrets/pepper | awk '{print $1}')
+
+if [ "$SRC_SHA" = "$DST_SHA" ] && [ -n "$SRC_SHA" ]; then
+    echo "PEPPER_VERIFICATION=MATCHED (SHA-256 verified identical byte-for-byte)"
 else
-    echo "VERIFIED: Pepper migrated byte-for-byte successfully."
+    echo "ERROR: PEPPER_VERIFICATION=FAILED (MISMATCH)" && exit 1
 fi
 ```
 
-### 2. نقل مفتاح OpenRouter إلى ملف مستقل
+### 4. فحص التكافؤ الوظيفي في توليد HMAC
+قبل تنفيذ Cutover، يتم التأكد من أن القيمة المقروءة من الملف في الحاوية المرشحة تنتج نفس توقيع HMAC لمفتاح عميل تجريبي مقارنة بالقيمة القديمة:
 ```bash
-# إدخال المفتاح تفاعلياً دون حفظه في سجل الأوامر (history)
-echo -n "Enter OpenRouter API Key: "
-read -s OPENROUTER_TOKEN
-echo ""
-echo -n "$OPENROUTER_TOKEN" | sudo tee /etc/ai-gateway/secrets/openrouter_key > /dev/null
-unset OPENROUTER_TOKEN
-
-sudo chown 10001:10001 /etc/ai-gateway/secrets/openrouter_key
-sudo chmod 0400 /etc/ai-gateway/secrets/openrouter_key
+# التحقق من أن resolve_secret يولد نفس توقيع HMAC دون كشف السر:
+docker exec -i <CANDIDATE_CONTAINER_ID> python -c '
+import hmac, hashlib
+from app.secret_loader import resolve_secret
+p = resolve_secret("GATEWAY_PEPPER").encode("utf-8")
+sig = hmac.new(p, b"gw_canary_test_token", hashlib.sha256).hexdigest()
+print(f"PEPPER_HMAC_CANARY={sig}")
+'
 ```
-
-### 3. عزل متغيرات البيئة في Docker Config.Env
-- تُحقن المسارات فقط عبر متغيرات البيئة:
-  ```env
-  GATEWAY_PEPPER_FILE=/secrets/pepper
-  OPENROUTER_API_KEY_FILE=/secrets/openrouter_key
-  ```
-- **حظر قطعي:** يمنع منعاً باتاً وجود `GATEWAY_PEPPER` أو `OPENROUTER_API_KEY` كمتغيرات صريحة.
-- **التحقق:**
-  ```bash
-  docker inspect <CONTAINER_ID> --format '{{json .Config.Env}}' | grep -E 'sk-|openrouter' && echo "LEAK DETECTED" || echo "CLEAN"
-  ```
 
 ---
 
-## 5. البند D: النسخ الاحتياطي والتراجع (Backup & Rollback)
+## 4. البند 3: فحص Docker Config.Env الآمن (Zero Value Leakage)
 
-### 1. التحقق من النسخة القديمة
-- أثبت التدقيق في Claim A8 أن ملف `scripts/backup.sh` لم يكن موجوداً أصلاً في الالتزام الأساسي `70b4027`، ولم تكن هناك نسخة احتياطية سابقة محفوظة في مستودع Git. أي نسخ سابقة أنشأها المشغل يدوياً يجب التحقق من موقعها وبصمتها قبل التبديل.
+تم استبدال أمر `grep` القديم الذي كان يهدد بعرض سطور الأسرار، بأمر فحص آمن ومحكم يفحص وجود وغياب أسماء المتغيرات فقط، ولا يطبع أي قيم أو مخرجات JSON:
 
-### 2. إجراء أخذ Online Backup حي قبل الـ Cutover
-يتم تنفيذ النسخ الاحتياطي عبر واجهة SQLite الرسمية والآمنة لتفادي تلف ملفات WAL:
 ```bash
-# إنشاء مجلد النسخ الاحتياطي المؤرخ
-BACKUP_DIR="/var/backups/ai-gateway/$(date +%Y%m%d)"
-sudo mkdir -p "$BACKUP_DIR"
-sudo chmod 0700 "$BACKUP_DIR"
+docker inspect <CONTAINER_ID> --format '{{json .Config.Env}}' | python3 -c '
+import sys, json
 
-# تشغيل النسخ الحي من داخل الحاوية الحالية قبل إيقافها:
-docker exec <CURRENT_CONTAINER_ID> python -m app.admin backup /data/backups/pre-cutover.sqlite3
+env_list = json.load(sys.stdin)
+names = [e.split("=", 1)[0] for e in env_list if "=" in e]
 
-# نقل ملف النسخة الاحتياطية إلى مضيف الإنتاج:
-docker cp <CURRENT_CONTAINER_ID>:/data/backups/pre-cutover.sqlite3 "$BACKUP_DIR/pre-cutover.sqlite3"
+print("GATEWAY_PEPPER_DIRECT=" + ("PRESENT" if "GATEWAY_PEPPER" in names else "ABSENT"))
+print("OPENROUTER_API_KEY_DIRECT=" + ("PRESENT" if "OPENROUTER_API_KEY" in names else "ABSENT"))
+print("GATEWAY_PEPPER_FILE=" + ("PRESENT" if "GATEWAY_PEPPER_FILE" in names else "ABSENT"))
+print("OPENROUTER_API_KEY_FILE=" + ("PRESENT" if "OPENROUTER_API_KEY_FILE" in names else "ABSENT"))
 
-# التحقق من سلامة النسخة الاحتياطية وصحة الجداول:
-sqlite3 "$BACKUP_DIR/pre-cutover.sqlite3" "PRAGMA integrity_check;"
-# الناتج الإلزامي: ok
-
-# فحص عدد العملاء وسجلات الاستخدام:
-sqlite3 "$BACKUP_DIR/pre-cutover.sqlite3" "SELECT count(*) FROM clients; SELECT count(*) FROM request_logs;"
+assert "GATEWAY_PEPPER" not in names, "FAIL: GATEWAY_PEPPER is present directly in Config.Env"
+assert "OPENROUTER_API_KEY" not in names, "FAIL: OPENROUTER_API_KEY is present directly in Config.Env"
+assert "GATEWAY_PEPPER_FILE" in names, "FAIL: GATEWAY_PEPPER_FILE missing"
+assert "OPENROUTER_API_KEY_FILE" in names, "FAIL: OPENROUTER_API_KEY_FILE missing"
+'
 ```
 
-### 3. تحليل توافق مخطط SQLite وقابلية التراجع (Schema Backward Compatibility)
-- في الالتزام الأساسي `70b4027`، كانت الجداول المنشأة هي: `clients`, `rate_limits`, `request_logs` مع `PRAGMA user_version = 0`.
-- في الالتزام المعتمد الجديد (F-010 في `app/database.py`):
-  - تم تعريف نظام ترحيلات ذكي:
-    ```python
-    current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    has_tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clients'").fetchone()[0] > 0
-    if current_version == 0 and has_tables:
-        current_version = 1
-        conn.execute("PRAGMA user_version = 1")
-    ```
-  - المخطط الجديد لم يحذف أي عمود، ولم يغيّر أسماء الجداول، ولم يضف قيوداً تمنع قراءة الإصدار القديم.
-  - **النتيجة:** الكود القديم يعمل مباشرة وبشكل متوافق 100% مع قاعدة البيانات حتى بعد تعيين `user_version = 1`، لأن الكود القديم يعتمد على `CREATE TABLE IF NOT EXISTS` ولا يتحقق من رقم الإصدار.
-
-### 4. حظر تشغيل نسختين على نفس الحجم (Zero Concurrency Rule)
-- **قاعدة قطعية:** يُمنع تشغيل الحاوية القديمة والحاوية الجديدة في نفس اللحظة وهما مرتبطتان بالحجم `ai-gateway-v1-data`. ذلك يؤدي إلى تضارب أقفال SQLite WAL locking وتلف محتمل لقاعدة البيانات.
+### الناتج الفعلي المثبت في CI (`43492784228`):
+```text
+GATEWAY_PEPPER_DIRECT=ABSENT
+OPENROUTER_API_KEY_DIRECT=ABSENT
+GATEWAY_PEPPER_FILE=PRESENT
+OPENROUTER_API_KEY_FILE=PRESENT
+PASS: Zero literal secrets in Docker Config.Env (uses _FILE paths only)
+```
 
 ---
 
-## 6. البند E: تسلسل النشر المقترح (Proposed Cutover Sequence)
+## 5. البند 4: تحديث Compose وسكربت النسخ الاحتياطي (Compose & Scripts Alignment)
 
-عند موافقة المالك المستقلة، يتم اتباع الخطوات التالية بالتسلسل الدقيق:
+### 1. تحديث [docker-compose.yml](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/docker-compose.yml)
+تم تحديث الملف بالكامل في المستودع ليتطابق مع أعلى معايير الأمان المعتمدة:
+```yaml
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-gateway-v1:candidate-4d95c42
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8000
+      - GATEWAY_CONFIG=/app/config/config.yaml
+      - GATEWAY_DATABASE_PATH=/data/gateway.sqlite3
+      - GATEWAY_PEPPER_FILE=/secrets/pepper
+      - OPENROUTER_API_KEY_FILE=/secrets/openrouter_key
+    volumes:
+      - ai-gateway-v1-data:/data
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - /etc/ai-gateway/secrets:/secrets:ro
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
+volumes:
+  ai-gateway-v1-data:
+    name: ai-gateway-v1-data
 ```
-[Phase 1: التحضير]  --->  [Phase 2: النسخ الاحتياطي]  --->  [Phase 3: الإيقاف والتبديل]  --->  [Phase 4: التحقق الأمني]
-  - بناء الصورة           - أخذ online backup             - إيقاف الحاوية القديمة          - فحص healthz
-  - فحص أذونات الأسرار    - فحص integrity_check            - تشغيل الحاوية الجديدة          - فحص مفاتيح العملاء
-                                                          - نفس named volume              - فحص استجابة OpenRouter
-```
+*(تمت إزالة `GATEWAY_PEPPER=${GATEWAY_PEPPER}` نهائياً، وفرض القراءة فقط، ونظام tmpfs، وتركيب الأسرار بـ `:ro`).*
 
-### الخطوات التفصيلية:
-1. **نافذة الصيانة والتجهيز:**
-   - التأكد من جاهزية ملفات الأسرار والإعدادات:
-     - `/etc/ai-gateway/secrets/pepper` (`0400`)
-     - `/etc/ai-gateway/secrets/openrouter_key` (`0400`)
-     - `/etc/ai-gateway/config.yaml` (`0644`)
-2. **النسخ الاحتياطي الفوري:**
-   - تنفيذ أمر النسخ الاحتياطي والتأكد من نتيجة `integrity_check` كما ورد في البند D.
-3. **إيقاف الحاوية القديمة:**
-   ```bash
-   docker stop <CURRENT_CONTAINER_ID>
-   ```
-4. **تشغيل الحاوية الجديدة المرشحة بالصورة المعتمدة:**
-   ```bash
-   docker run -d \
-     --name ai-gateway-v1-production \
-     --restart unless-stopped \
-     -p 127.0.0.1:8000:8000 \
-     --user 10001:10001 \
-     --read-only \
-     --cap-drop ALL \
-     --security-opt no-new-privileges \
-     --memory 512m \
-     --cpus 1.0 \
-     --pids-limit 100 \
-     --tmpfs /tmp:uid=10001,gid=10001,mode=0700 \
-     -v ai-gateway-v1-data:/data \
-     -v /etc/ai-gateway/secrets:/secrets:ro \
-     -v /etc/ai-gateway/config.yaml:/app/config/config.yaml:ro \
-     -e GATEWAY_CONFIG=/app/config/config.yaml \
-     -e GATEWAY_PEPPER_FILE=/secrets/pepper \
-     -e OPENROUTER_API_KEY_FILE=/secrets/openrouter_key \
-     ai-gateway-v1:candidate-4d95c42
-   ```
-5. **التحقق التشغيلي والمصادقة (Post-Cutover Smoke Tests):**
-   - فحص نقطة الصحة:
-     ```bash
-     curl -fsS http://127.0.0.1:8000/healthz
-     # المتوقع: {"status":"ok"}
-     ```
-   - فحص مصادقة عميل قائم بمفتاحه الفعلي:
-     ```bash
-     curl -i -H "Authorization: Bearer gw_<CLIENT_KEY>" http://127.0.0.1:8000/v1/models
-     # المتوقع: 200 OK وقائمة النماذج المعرفة (fast)
-     ```
-   - فحص رفض مفتاح غير صالح:
-     ```bash
-     curl -i -H "Authorization: Bearer gw_invalid_key" http://127.0.0.1:8000/v1/models
-     # المتوقع: 401 Unauthorized
-     ```
-   - اختبار طلب دردشة تجريبي عبر OpenRouter:
-     ```bash
-     curl -i -H "Authorization: Bearer gw_<CLIENT_KEY>" \
-       -H "Content-Type: application/json" \
-       -d '{"model":"fast","messages":[{"role":"user","content":"ping"}]}' \
-       http://127.0.0.1:8000/v1/chat/completions
-     # المتوقع: 200 OK مع استجابة مكتملة وتسجيل الـ usage
-     ```
-6. **إجراء التراجع الطارئ (Rollback Plan):**
-   - في حال حدوث أي خطأ في فحص الصحة أو رفض مفاتيح العملاء (عدم تطابق Pepper):
-     ```bash
-     echo "TRIGGERING IMMEDIATE ROLLBACK..."
-     docker stop ai-gateway-v1-production
-     docker rm ai-gateway-v1-production
-     # إعادة تشغيل الحاوية القديمة:
-     docker start <CURRENT_CONTAINER_ID>
-     curl -fsS http://127.0.0.1:8000/healthz
-     ```
+### 2. تحديث [scripts/backup.sh](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/scripts/backup.sh)
+تم تحديث السكربت ليدعم الحاويات المشغلة بـ `docker run` (مثل `ai-gateway-v1` أو `ai-gateway-v1-production`) و Compose دون افتراض مسبق:
+```sh
+#!/bin/sh
+set -eu
+
+DEST="${1:-/data/backups/backup-$(date +%Y%m%d%H%M%S).sqlite3}"
+
+if command -v docker >/dev/null 2>&1 && docker compose ps --services 2>/dev/null | grep -q gateway; then
+    docker compose exec -T gateway python -m app.admin backup "$DEST"
+elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE '^(ai-gateway-v1|gateway|ai-gateway-v1-production)$'; then
+    CONTAINER_NAME="$(docker ps --format '{{.Names}}' | grep -m1 -E '^(ai-gateway-v1|gateway|ai-gateway-v1-production)$')"
+    docker exec -T "$CONTAINER_NAME" python -m app.admin backup "$DEST"
+else
+    python -m app.admin backup "$DEST"
+fi
+```
 
 ---
 
-## 7. المخاطر المتبقية وإجراءات التخفيف (Residual Risks)
+## 6. البند 5: توثيق هوية الصورة ونقلها (Image Identity & Artifact Integrity)
 
-| الخطر المتبقي | الاحتمالية / الأثر | إجراء التخفيف المعتمد |
-| :--- | :---: | :--- |
-| **خطأ بشري في نسخ الـ Pepper** | منخفض / حرج | استخدام فحص `sha256sum` التلقائي المبرمج قبل إيقاف الحاوية القديمة. |
-| **تغيير في صيغة استجابات OpenRouter** | منخفض / متوسط | تغليف الاستجابة بـ Safe Response Validation والحد الأقصى لحجم الاستجابة (F-009). |
-| **انقطاع شبكة المزود الخارجي** | متوسط / منخفض | إرجاع خطأ قياسي 502 دون تسريب بيانات أو مفاتيح، مع تفعيل Fallback تلقائي لمزود بديل. |
-| **تعارض منافذ المضيف 8000** | منخفض / منخفض | تم التحقق مسبقاً من حصر الاستماع على `127.0.0.1` وخلو المضيف من أي تعارض. |
+### 1. التمييز الحاسم بين صورة CI وصورة إعادة البناء
+- **صورة CI المختبرة:**
+  - البناء في CI Runner ينتج معرفاً فريداً (`sha256:18c76303a78d35142ad05e02308ae58e318dc20d6d7b6db5150baaa3a593a439`).
+  - هذا المعرف يعتمد على بيئة البناء وتوقيتات الطبقات، ولا يمكن افتراض تطابقه المسبق مع أي إعادة بناء محلية على خادم الإنتاج.
+- **إعادة البناء على خادم الإنتاج:**
+  - عند البناء من الالتزام `8e987a0` على خادم الإنتاج:
+    `docker build --no-cache -t ai-gateway-v1:candidate-production .`
+  - **الإجراء الإلزامي:** يجب قياس وتسجيل الـ `Image ID` الفعلي الناتج على الخادم فور اكتمال البناء:
+    `PROD_IMAGE_ID=$(docker inspect --format '{{.Id}}' ai-gateway-v1:candidate-production)`
+  - فحص أمان الصورة المبنية محلياً (المستخدم `10001:10001`، غياب `pytest`، خلوها من ملفات `.env`).
+- **خيار النقل المباشر عبر الأثر (Artifact Transfer):**
+  - في حال رغبة المالك في نقل نفس الصورة المبنية في CI دون إعادة بناء، يتم تصديرها كـ artifact مضغوط وموقع (`docker save | gzip > image.tar.gz`)، ثم نقلها واستيرادها بـ `docker load` على الخادم.
 
 ---
 
-## 8. الخاتمة والقرار النهائي
+## 7. البند 6: اختبار التوافق العكسي لـ SQLite والتراجع (SQLite Compatibility & Rollback Validation)
 
-استوفت البوابة المرشحة كافة المعايير الهندسية والأمنية:
-1. إغلاق الثغرات الأمنية السابقة (F-001 إلى F-010) بشكل قطعي ومثبت بالاختبارات.
-2. اجتياز جميع اختبارات Linux (103 اختبارات) دون تخطي، بما فيها أذونات POSIX للأسرار، وحماية SSRF المتقدمة، وتثبيت مقابس الاتصال.
-3. جاهزية كاملة لخطة نقل الأسرار والنسخ الاحتياطي والتراجع دون أي مخاطرة ببيانات الإنتاج.
+تم تصميم وتنفيذ اختبار توافقية شامل ومستقل تماماً في [tests/test_sqlite_backward_compatibility.py](file:///C:/Users/Aledari/.gemini/antigravity/scratch/ai-gateway-v1/tests/test_sqlite_backward_compatibility.py)، واجتاز الاختبارات على Linux في CI بنجاح تام:
+
+### مراحل الاختبار المستقل ونتائجه:
+1. **إنشاء قاعدة بيانات وفق المخطط القديم للالتزام الأساسي `70b4027`:**
+   - تطبيق الجداول القديمة `clients`, `rate_limits`, `request_logs`.
+   - إثبات أن `PRAGMA user_version = 0`.
+   - إضافة عميل قديم بمفتاح وتوقيع HMAC حقيقي وسجلات استخدام.
+2. **الترقية إلى إصدار التطبيق الجديد:**
+   - تشغيل `Database.init()` و `migrate()`.
+   - التأكد من `PRAGMA integrity_check == "ok"`.
+   - التأكد من تحديث `PRAGMA user_version = 1`.
+   - **التحقق من المصادقة:** نجاح مصادقة العميل القديم عبر `authenticate_key` ومطابقة مفتاحه القديم بنسبة 100%.
+   - إضافة عميل جديد واستهلاك معدل الطلبات (Rate Limiting).
+3. **محاكاة التراجع التام (Simulated Rollback) إلى كود التطبيق القديم (`70b4027`):**
+   - فتح قاعدة البيانات نفسها بكود الاتصال القديم وتشغيل `CREATE TABLE IF NOT EXISTS` كما كان يفعل الكود القديم عند البدء.
+   - التأكد من `PRAGMA integrity_check == "ok"`.
+   - **قراءة العملاء القدامى والجدد:** استطاع الكود القديم قراءة العميلين دون أي خطأ.
+   - **الكتابة واستهلاك الموارد:** استطاع الكود القديم كتابة سجلات طلبات جديدة واستهلاك معدل الطلبات دون أي اعتراض.
+4. **الخلاصة:**
+   - **نسبة التوافق العكسي: 100%.**
+   - لا توجد أي أعمدة محذوفة أو تغييرات تكسر عمل النسخة القديمة في حال الاضطرار للتراجع.
+
+---
+
+## 8. تسلسل Cutover المحدث والمصحح (Future Cutover Execution Protocol)
+
+عند صدور موافقة المالك الرسمية، يُنفذ تسلسل التبديل بالخطوات المصححة التالية:
+
+```
+1. التحضير:
+   - بناء الصورة وقياس Image ID.
+   - ضبط مجلد الأسرار /etc/ai-gateway/secrets (root:10001, 0750).
+   - استخراج Pepper بالبايتات الخام من ذاكرة الحاوية الحالية والتحقق من تطابق sha256.
+   - وضع مفتاح OpenRouter بصلاحيات 0400 (10001:10001).
+
+2. النسخ الاحتياطي:
+   - أخذ Online Backup حي عبر python -m app.admin backup.
+   - التحقق من PRAGMA integrity_check على النسخة الاحتياطية.
+
+3. نافذة التبديل (Maintenance Window):
+   - إيقاف الحاوية القديمة: docker stop <OLD_CONTAINER_ID>.
+   - تشغيل الحاوية الجديدة بـ --read-only, --tmpfs /tmp, -v /etc/ai-gateway/secrets:/secrets:ro.
+   - ربط المنفذ 127.0.0.1:8000:8000 ونفس الـ named volume ai-gateway-v1-data.
+
+4. التحقق بعد التبديل:
+   - فحص Config.Env بأمر Python الآمن للتأكد من غياب الأسرار المباشرة ووجود مسارات _FILE.
+   - فحص /healthz (المتوقع: {"status":"ok"}).
+   - فحص مصادقة عميل حالي حقيقي للتأكد من استمرار صلاحية مفاتيحه (المتوقع: 200 OK).
+   - فحص رفض المفاتيح غير المصرح بها (المتوقع: 401).
+   - اختبار طلب دردشة تجريبي عبر OpenRouter والتأكد من تسجيل الاستهلاك.
+
+5. شروط التراجع الفوري (Rollback Trigger):
+   - إذا فشل /healthz أو فشلت مصادقة العملاء الحاليين (401):
+     إيقاف الحاوية الجديدة فوراً، وتشغيل الحاوية القديمة (docker start <OLD_CONTAINER_ID>).
+```
+
+---
+
+## 9. الخاتمة والقرار النهائي
+
+بعد تصحيح جميع الملاحظات الأمنية والهندسية الحساسة:
+1. تصحيح صلاحيات مجلد الأسرار إلى `0750` (`root:10001`) وإثبات فتح الملفات بنجاح من قبل المستخدم `10001:10001`.
+2. اعتماد بروتوكول نقل البايتات الخام للـ Pepper دون أي تطبيع أو تشويه (`Zero Normalization`).
+3. اعتماد فحص بيئة الحاوية الآمن دون أي تسريب لقيم الأسرار في السجلات.
+4. تحديث `docker-compose.yml` و`scripts/backup.sh` لتتوافق مع قيود الأمان والتشغيل الفعلي.
+5. إثبات التوافق العكسي التام لـ SQLite بنسبة 100% في حال التراجع.
+6. اجتياز 104 اختبارات كاملة على Linux في CI بنجاح تام وبدون أي اختبار متخطٍ أو فاشل.
 
 **القرار النهائي:**
 ### `READY FOR OWNER CUTOVER APPROVAL`
-(المشروع في حالة استقرار تام وجاهز لصدور موافقة المالك المستقلة لتحديد موعد نافذة التبديل والبدء بالتنفيذ).
+(المشروع مكتمل وجاهز تقنياً وأمنياً للموافقة المستقلة من المالك لتحديد موعد نافذة التبديل والبدء بالتنفيذ).
