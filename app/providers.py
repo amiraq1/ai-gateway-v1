@@ -10,6 +10,7 @@ from .secret_loader import SecretLoadError, resolve_secret
 
 RETRYABLE_STATUS = {429, *range(500, 600)}
 MAX_ATTEMPTS = 2
+MAX_PROVIDER_RESPONSE_BYTES = 10 * 1024 * 1024
 
 
 class ProviderFailure(Exception):
@@ -49,20 +50,32 @@ async def complete(providers: list[ProviderConfig], payload: dict[str, Any], tim
         body = dict(payload)
         body["model"] = provider.model
         try:
+            body_bytes = bytearray()
             async with httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False) as client:
-                response = await client.post(_url(provider), headers=_headers(provider), json=body)
-            if response.status_code in RETRYABLE_STATUS:
-                last = ProviderFailure("provider_unavailable", 502, True)
-                if index + 1 < min(len(providers), MAX_ATTEMPTS):
-                    continue
-                raise last
-            if response.status_code in {401, 403}:
-                raise ProviderFailure("provider_authentication", 502, False)
-            if response.status_code < 200 or response.status_code >= 300:
-                raise ProviderFailure("provider_rejected_request", 502, False)
+                async with client.stream("POST", _url(provider), headers=_headers(provider), json=body) as response:
+                    if response.status_code in RETRYABLE_STATUS:
+                        await response.aread()
+                        last = ProviderFailure("provider_unavailable", 502, True)
+                        if index + 1 < min(len(providers), MAX_ATTEMPTS):
+                            continue
+                        raise last
+                    if response.status_code in {401, 403}:
+                        raise ProviderFailure("provider_authentication", 502, False)
+                    if response.status_code < 200 or response.status_code >= 300:
+                        raise ProviderFailure("provider_rejected_request", 502, False)
+
+                    cl_hdr = response.headers.get("content-length")
+                    if cl_hdr and cl_hdr.isdigit() and int(cl_hdr) > MAX_PROVIDER_RESPONSE_BYTES:
+                        raise ProviderFailure("provider_response_too_large", 502, False)
+
+                    async for chunk in response.aiter_bytes():
+                        body_bytes.extend(chunk)
+                        if len(body_bytes) > MAX_PROVIDER_RESPONSE_BYTES:
+                            raise ProviderFailure("provider_response_too_large", 502, False)
+
             try:
-                data = response.json()
-            except (ValueError, json.JSONDecodeError):
+                data = json.loads(body_bytes.decode("utf-8"))
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
                 raise ProviderFailure("provider_malformed_response", 502, False) from None
             if not isinstance(data, dict) or not isinstance(data.get("choices"), list):
                 raise ProviderFailure("provider_malformed_response", 502, False)
