@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 from app.config import _validate_api_base
 
 

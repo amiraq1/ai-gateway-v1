@@ -14,10 +14,9 @@ if command -v docker >/dev/null 2>&1 && docker compose ps --services 2>/dev/null
     echo "Creating online backup inside Compose gateway container..."
     docker compose exec -T gateway python -m app.admin backup "$CONTAINER_TEMP"
 
-    # Copy backup out of the container volume onto the host
-    CONTAINER_ID="$(docker compose ps -q gateway)"
+    # Transfer backup out of the container onto the host (stream extraction supports tmpfs mounts)
     echo "Transferring backup from container to host destination: $DEST"
-    docker cp "${CONTAINER_ID}:${CONTAINER_TEMP}" "$DEST"
+    docker compose exec -T gateway cat "$CONTAINER_TEMP" > "$DEST"
 
     # Verify backup on host
     chmod 0600 "$DEST"
@@ -44,9 +43,9 @@ elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev
     echo "Creating online backup inside Docker container ${CONTAINER_NAME}..."
     docker exec "$CONTAINER_NAME" python -m app.admin backup "$CONTAINER_TEMP"
 
-    # Copy backup out of the container volume onto the host
+    # Transfer backup out of the container onto the host (stream extraction supports tmpfs mounts)
     echo "Transferring backup from container to host destination: $DEST"
-    docker cp "${CONTAINER_NAME}:${CONTAINER_TEMP}" "$DEST"
+    docker exec "$CONTAINER_NAME" cat "$CONTAINER_TEMP" > "$DEST"
 
     # Verify backup on host
     chmod 0600 "$DEST"
