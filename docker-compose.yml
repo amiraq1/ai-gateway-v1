@@ -1,0 +1,26 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-gateway-v1:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8000
+      - GATEWAY_CONFIG=/app/config/config.yaml
+      - GATEWAY_DATABASE_PATH=/data/gateway.sqlite3
+      - GATEWAY_PEPPER=${GATEWAY_PEPPER}
+    volumes:
+      - ai-gateway-v1-data:/data
+      - ./config/config.yaml:/app/config/config.yaml:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  ai-gateway-v1-data:
+    name: ai-gateway-v1-data
