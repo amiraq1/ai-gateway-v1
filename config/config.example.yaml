@@ -1,0 +1,19 @@
+settings:
+  host: 127.0.0.1
+  port: 8000
+  database_path: /data/gateway.sqlite3
+  provider_timeout_seconds: 45
+  max_body_bytes: 1048576
+  retention_days: 30
+
+models:
+  fast:
+    enabled: false
+    providers:
+      - name: replace-with-provider-name
+        model: REPLACE_WITH_VERIFIED_MODEL_ID
+        api_base: https://provider.example.invalid/v1
+        api_key_env: PROVIDER_API_KEY
+        enabled: false
+      # Add one fallback provider only after checking its actual compatibility,
+      # endpoint, model ID, API key variable, and data-sharing implications.
