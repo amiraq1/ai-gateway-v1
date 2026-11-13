@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .config import ProviderConfig
+from .config import ProviderConfig, validate_provider_key_env
 from .secret_loader import SecretLoadError, resolve_secret
 
 RETRYABLE_STATUS = {429, *range(500, 600)}
@@ -25,6 +25,10 @@ def _url(provider: ProviderConfig) -> str:
 
 
 def _headers(provider: ProviderConfig) -> dict[str, str]:
+    try:
+        validate_provider_key_env(provider.api_key_env)
+    except ValueError:
+        raise ProviderFailure("provider_secret_unavailable", 503, False) from None
     try:
         secret = resolve_secret(provider.api_key_env)
     except SecretLoadError:

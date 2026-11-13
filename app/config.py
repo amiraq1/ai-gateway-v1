@@ -52,6 +52,29 @@ class GatewayConfig:
         return sorted(alias for alias in self.models if self.providers_for(alias))
 
 
+DISALLOWED_KEY_ENVS = frozenset({
+    "PATH", "USER", "HOME", "SHELL", "PWD", "TEMP", "TMP", "USERNAME",
+    "SYSTEMROOT", "WINDIR", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH",
+})
+
+ALLOWED_KEY_PREFIXES = (
+    "PROVIDER_", "OPENAI_", "ANTHROPIC_", "COHERE_", "MISTRAL_",
+    "GROQ_", "DEEPSEEK_", "AZURE_", "TEST_",
+)
+
+
+def validate_provider_key_env(env_name: str, allowed_list: set[str] | None = None) -> str:
+    cleaned = env_name.strip()
+    upper = cleaned.upper()
+    if upper.startswith("GATEWAY_") or upper in DISALLOWED_KEY_ENVS:
+        raise ValueError(f"Environment variable {env_name!r} is not an allowed provider key environment variable (internal/system variable)")
+    if allowed_list is not None and upper not in allowed_list:
+        raise ValueError(f"Environment variable {env_name!r} is not in the allowed provider key list")
+    if allowed_list is None and not any(upper.startswith(prefix) for prefix in ALLOWED_KEY_PREFIXES):
+        raise ValueError(f"Environment variable {env_name!r} is not an allowed provider key environment variable (must start with standard provider prefix or be explicitly allowlisted)")
+    return cleaned
+
+
 def _validate_api_base(value: str, provider_name: str) -> str:
     parts = urlsplit(value)
     if parts.scheme not in {"https", "http"} or not parts.netloc:
@@ -100,6 +123,7 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
             key_env = str(item.get("api_key_env", "")).strip()
             if not name or not model_id or not key_env or not key_env.replace("_", "").isalnum():
                 raise ValueError(f"Provider for {alias!r} requires name, model, and api_key_env")
+            key_env = validate_provider_key_env(key_env)
             api_base = _validate_api_base(str(item.get("api_base", "")), name)
             providers.append(ProviderConfig(name, model_id, api_base, key_env, bool(item.get("enabled", True))))
         models[alias] = ModelConfig(alias, bool(entry.get("enabled", True)), tuple(providers))
