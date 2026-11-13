@@ -47,6 +47,9 @@ def test_invalid_and_revoked_client_keys_return_401(gateway):
         assert invalid.status_code == 401
         token = key(db)
         client_id = db.list_clients()[0]["client_id"]
+        # Forged secret for an existing client_id must be rejected with 401
+        forged = f"gw_{client_id}.forged-wrong-secret-token-abcdef123"
+        assert client.get("/v1/models", headers={"Authorization": f"Bearer {forged}"}).status_code == 401
         assert db.revoke_client(client_id)
         revoked = client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
         assert revoked.status_code == 401

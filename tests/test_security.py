@@ -19,6 +19,8 @@ def test_key_is_hmac_digest_only_and_revoke_is_immediate(tmp_path):
     assert stored["key_digest"] == hmac.new(PEPPER.encode(), raw.encode(), hashlib.sha256).hexdigest()
     assert raw not in stored["key_digest"]
     assert authenticate_key(db, PEPPER, raw)["client_id"] == client_id
+    forged = f"gw_{client_id}.forged-invalid-secret-key-material"
+    assert authenticate_key(db, PEPPER, forged) is None
     assert db.revoke_client(client_id)
     assert authenticate_key(db, PEPPER, raw) is None
     assert db.list_clients()[0]["client_id"] == client_id
