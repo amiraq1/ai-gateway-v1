@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,12 +76,37 @@ def validate_provider_key_env(env_name: str, allowed_list: set[str] | None = Non
     return cleaned
 
 
-def _validate_api_base(value: str, provider_name: str) -> str:
+def _is_forbidden_target(hostname: str) -> bool:
+    lower = hostname.lower()
+    if lower in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or lower.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or str(ip).startswith("169.254.")
+        )
+    except ValueError:
+        return False
+
+
+def _validate_api_base(value: str, provider_name: str, allow_insecure_http: bool = False) -> str:
     parts = urlsplit(value)
     if parts.scheme not in {"https", "http"} or not parts.netloc:
-        raise ValueError(f"Provider {provider_name!r} api_base must be an absolute HTTP(S) URL")
+        raise ValueError(f"Provider {provider_name!r} api_base must be an absolute URL")
+    if parts.scheme == "http" and not allow_insecure_http:
+        raise ValueError(f"Provider {provider_name!r} api_base must use HTTPS")
     if parts.username or parts.password or parts.query or parts.fragment:
         raise ValueError(f"Provider {provider_name!r} api_base cannot contain credentials, query, or fragment")
+
+    hostname = parts.hostname or ""
+    if not hostname or _is_forbidden_target(hostname):
+        raise ValueError(f"Provider {provider_name!r} api_base violates SSRF protection: target {hostname!r} is a forbidden internal, private, loopback, or link-local address")
+
     return value.rstrip("/")
 
 
