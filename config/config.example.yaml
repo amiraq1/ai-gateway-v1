@@ -15,5 +15,11 @@ models:
         api_base: https://provider.example.invalid/v1
         api_key_env: PROVIDER_API_KEY
         enabled: false
+        # Public providers must use HTTPS on port 443. Blocked ranges (metadata, link-local,
+        # multicast, and similar) are refused even when listed here.
+        # For an internal provider only, list the exact networks it resolves to. This also
+        # allows plain HTTP and a non-443 port for that provider, so use it deliberately:
+        # trusted_internal_networks: ["10.20.0.0/16"]
+        # api_base: http://10.20.0.15:8080/v1
       # Add one fallback provider only after checking its actual compatibility,
       # endpoint, model ID, API key variable, and data-sharing implications.
