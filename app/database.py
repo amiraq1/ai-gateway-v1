@@ -3,8 +3,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from .migrations import LATEST_SCHEMA_VERSION, SchemaError, apply_pending_migrations, missing_tables, read_schema_version
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -15,40 +19,6 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS clients (
-    client_id TEXT PRIMARY KEY,
-    key_digest TEXT NOT NULL,
-    name TEXT NOT NULL,
-    rpm INTEGER NOT NULL CHECK (rpm > 0),
-    created_at INTEGER NOT NULL,
-    revoked_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_clients_digest ON clients(key_digest);
-CREATE TABLE IF NOT EXISTS rate_limits (
-    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
-    bucket INTEGER NOT NULL,
-    count INTEGER NOT NULL CHECK (count >= 0),
-    PRIMARY KEY(client_id, bucket)
-);
-CREATE TABLE IF NOT EXISTS request_logs (
-    id TEXT PRIMARY KEY,
-    timestamp_utc TEXT NOT NULL,
-    client_id TEXT NOT NULL,
-    model_alias TEXT NOT NULL,
-    provider_name TEXT,
-    status_code INTEGER NOT NULL,
-    latency_ms INTEGER NOT NULL,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    total_tokens INTEGER,
-    error_category TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_request_logs_timestamp ON request_logs(timestamp_utc);
-CREATE INDEX IF NOT EXISTS idx_request_logs_client ON request_logs(client_id, timestamp_utc);
-"""
-
-
 class Database:
     def __init__(self, path: str, timeout_seconds: float = 5.0) -> None:
         self.path = path
@@ -57,30 +27,82 @@ class Database:
             Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def connect(self) -> sqlite3.Connection:
+        """Open a connection with per-connection settings only.
+
+        journal_mode is persistent for the database file, so init() sets it once.
+        Re-issuing it on every connection would make each open contend for the lock.
+        """
         conn = sqlite3.connect(self.path, timeout=self.timeout_seconds, isolation_level=None, factory=_ClosingConnection)
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
-    def init(self) -> None:
-        if self.path != ":memory:":
-            old = os.umask(0o077)
-            try:
-                Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                with self.connect() as conn:
-                    conn.executescript(_SCHEMA)
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run statements in one IMMEDIATE transaction that commits only when the block succeeds."""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                # The connection is closed next, which also discards the transaction.
+                # A failed ROLLBACK must not hide the original error.
                 try:
-                    os.chmod(self.path, 0o600)
-                except OSError:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
                     pass
-            finally:
-                os.umask(old)
-        else:
-            with self.connect() as conn:
-                conn.executescript(_SCHEMA)
+            raise
+        finally:
+            conn.close()
+
+    def init(self) -> None:
+        if self.path == ":memory:":
+            with self.transaction() as conn:
+                apply_pending_migrations(conn)
+            return
+        old = os.umask(0o077)
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._enable_wal()
+            if self._schema_version() != LATEST_SCHEMA_VERSION:
+                self._backup_before_migration()
+                with self.transaction() as conn:
+                    apply_pending_migrations(conn)
+            else:
+                with self.connect() as conn:
+                    absent = missing_tables(conn)
+                if absent:
+                    raise SchemaError("Database schema is incomplete.")
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+        finally:
+            os.umask(old)
+
+    def _enable_wal(self) -> None:
+        with self.connect() as conn:
+            mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        if mode != "wal":
+            raise SchemaError("SQLite did not enable WAL journal mode.")
+
+    def _schema_version(self) -> int:
+        with self.connect() as conn:
+            return read_schema_version(conn)
+
+    def _backup_before_migration(self) -> None:
+        """Copy an existing database before migrating it; a new database has nothing to protect."""
+        with self.connect() as conn:
+            has_data = conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0] > 0
+            version = read_schema_version(conn)
+        if not has_data:
+            return
+        destination = f"{self.path}.pre-schema-v{version}-{int(time.time())}.bak"
+        self.backup_to(destination)
 
     def add_client(self, client_id: str, digest: str, name: str, rpm: int, now: int | None = None) -> None:
         if rpm < 1 or rpm > 1_000_000:
