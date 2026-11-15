@@ -122,11 +122,48 @@ _V4_PROVIDER_SECRETS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_provider_secrets_key_version ON provider_secrets(key_version)",
 )
 
+_V5_CONVERSATIONS: tuple[str, ...] = (
+    # Conversation text is stored as plain SQLite text. Protect the database file and its backups accordingly.
+    """CREATE TABLE IF NOT EXISTS conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_user_id INTEGER NOT NULL REFERENCES admin_users(id),
+        title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+        model_alias TEXT NOT NULL CHECK (length(model_alias) BETWEEN 1 AND 64),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        archived_at INTEGER
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_conversations_owner_updated ON conversations(admin_user_id, updated_at, id)",
+    """CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) BETWEEN 1 AND 262144),
+        status TEXT NOT NULL CHECK (status IN ('processing', 'complete', 'failed', 'cancelled')),
+        model_alias TEXT CHECK (model_alias IS NULL OR length(model_alias) <= 64),
+        provider_name TEXT CHECK (provider_name IS NULL OR length(provider_name) <= 64),
+        error_category TEXT CHECK (error_category IS NULL OR length(error_category) <= 64),
+        request_id TEXT UNIQUE CHECK (request_id IS NULL OR length(request_id) BETWEEN 8 AND 64),
+        reply_to_message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        claimed_at INTEGER,
+        completed_at INTEGER,
+        prompt_tokens INTEGER CHECK (prompt_tokens IS NULL OR prompt_tokens >= 0),
+        completion_tokens INTEGER CHECK (completion_tokens IS NULL OR completion_tokens >= 0),
+        total_tokens INTEGER CHECK (total_tokens IS NULL OR total_tokens >= 0),
+        -- Only user turns can be in progress or failed. A stored assistant reply is always complete.
+        CHECK (role = 'user' OR status = 'complete')
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(conversation_id, created_at, id)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_message_id)",
+)
+
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: _V1_BASELINE,
     2: _V2_ADMIN,
     3: _V3_LOGIN_ATTEMPTS,
     4: _V4_PROVIDER_SECRETS,
+    5: _V5_CONVERSATIONS,
 }
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
 
@@ -140,6 +177,8 @@ REQUIRED_TABLES: frozenset[str] = frozenset({
     "admin_ip_rules",
     "login_attempts",
     "provider_secrets",
+    "conversations",
+    "messages",
 })
 
 
