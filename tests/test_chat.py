@@ -32,7 +32,7 @@ from app.conversations import (
     prepare_turn,
     trim_history,
 )
-from tests.support import build_gateway_app, serve_https, serve_slow_provider
+from tests.support import build_gateway_app, serve_https, serve_json_provider, serve_slow_provider
 
 PEPPER = "test-pepper-that-is-at-least-32-bytes-long"
 ADMIN_USER = "admin"
@@ -907,3 +907,27 @@ def test_cancelled_turn_never_stores_a_reply_even_if_the_provider_finished(chat)
     rows = _rows(db, "SELECT role, status, error_category FROM messages WHERE id = ?", (turn.user_message_id,))
     assert rows == [{"role": "user", "status": "cancelled", "error_category": "client_disconnected"}]
     assert _rows(db, "SELECT COUNT(*) AS n FROM messages WHERE role = 'assistant'")[0]["n"] == 0
+
+
+def test_non_stream_reply_is_kept_after_disconnect_and_replays_by_request_id(tmp_path, monkeypatch):
+    # A non-streamed turn finishes on the server even after the client has gone. The reply is stored once,
+    # and a retry with the same request_id returns it without a second provider call.
+    with serve_json_provider(delay_seconds=1.0) as stub:
+        app, db = _slow_app(tmp_path, monkeypatch, stub.port)
+        with serve_https(app, tmp_path / "tls") as (base, tls):
+            with _http_client(base, tls) as browser:
+                csrf = _http_login(browser)
+                headers = {"X-CSRF-Token": csrf}
+                body = {"model": "fast", "message": "answer after I leave", "request_id": "req-f2-000001"}
+                with pytest.raises(httpx.TimeoutException):
+                    browser.post("/api/chat/completions", json=body, headers=headers, timeout=0.2)
+                assert _wait_for_status(db, "req-f2-000001", {"complete", "failed", "cancelled"}) == "complete"
+                replay = browser.post("/api/chat/completions", json=body, headers=headers)
+    assert replay.status_code == 200
+    payload = replay.json()
+    assert payload["replayed"] is True
+    assert payload["choices"][0]["message"]["content"] == "stub reply"
+    assert len(stub.hits) == 1
+    replies = _rows(db, "SELECT id, content, status FROM messages WHERE role = 'assistant'")
+    assert [(row["content"], row["status"]) for row in replies] == [("stub reply", "complete")]
+    assert payload["message_id"] == replies[0]["id"]

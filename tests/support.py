@@ -141,3 +141,42 @@ def serve_slow_provider() -> Iterator[SlowProvider]:
     finally:
         server.shutdown()
         server.server_close()
+
+
+class _JsonProviderHandler(BaseHTTPRequestHandler):
+    """OpenAI-style JSON stub. It waits `delay_seconds` before answering, so a client can give up first."""
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server naming
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        self.server.hits.append(self.path)
+        time.sleep(self.server.delay_seconds)
+        body = json.dumps({
+            "id": "cmpl-json-stub",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "stub reply"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+@contextmanager
+def serve_json_provider(delay_seconds: float) -> Iterator[SlowProvider]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _JsonProviderHandler)
+    server.hits = []
+    server.delay_seconds = delay_seconds
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield SlowProvider(server.server_address[1], server.hits)
+    finally:
+        server.shutdown()
+        server.server_close()
