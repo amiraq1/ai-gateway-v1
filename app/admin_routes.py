@@ -14,12 +14,20 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from .audit import record_audit_event
 from .auth import Argon2Busy, LoginPolicy, authenticate_admin
 from .clock import now_epoch
-from .config import GatewayConfig
+from .config import GatewayConfig, validate_provider_api_key_env
+from .crypto import CryptoError, Keyring, load_keyring
+from .provider_secrets import (
+    AuditActor,
+    delete_provider_secret,
+    list_provider_secrets,
+    rotate_provider_secrets,
+    store_provider_secret,
+)
 from .database import Database
 from .ip_access import IpRule, IPAddress, is_request_allowed, parse_ip_or_cidr, resolve_client_ip
 from .migrations import read_schema_version
@@ -319,3 +327,90 @@ def delete_ip_rule(rule_id: int, request: Request, context: AdminContext = Depen
                            target=f"ip_rule:{rule_id}", ip_address=ip_text, user_agent=user_agent,
                            metadata={"rule_type": str(row["rule_type"]), "cidr": str(row["ip_or_cidr"])})
     return {"status": "deleted", "id": rule_id}
+
+
+# ---------------------------------------------------------------------------
+# Provider key management. Responses carry metadata only, never key values.
+# ---------------------------------------------------------------------------
+
+
+class ProviderSecretBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # SecretStr keeps the value out of repr(), logs, and validation messages.
+    api_key: SecretStr = Field(min_length=1, max_length=8192)
+
+
+def _provider_name(raw: str) -> str:
+    try:
+        return validate_provider_api_key_env(raw)
+    except ValueError:
+        raise AdminApiError(400, "invalid_provider_name",
+                            "Provider key name must end in _API_KEY and must not use a reserved prefix.",
+                            error_type="invalid_request_error") from None
+
+
+def _key_store_error() -> AdminApiError:
+    return AdminApiError(503, "provider_key_store_unavailable", "The provider key store is not available.",
+                         error_type="gateway_error")
+
+
+def _actor(request: Request, context: AdminContext) -> AuditActor:
+    ip_text, user_agent = _audit_actor(request)
+    return AuditActor(admin_user_id=context.session.admin_user_id, ip_address=ip_text,
+                      user_agent=user_agent, source="api")
+
+
+@router.get("/provider-secrets")
+def list_provider_secret_metadata(request: Request,
+                                  context: AdminContext = Depends(require_admin_session)) -> dict[str, object]:
+    return {"secrets": [
+        {"provider_name": info.provider_name, "key_version": info.key_version,
+         "created_at": info.created_at, "updated_at": info.updated_at}
+        for info in list_provider_secrets(_database(request))
+    ]}
+
+
+@router.put("/provider-secrets/{name}")
+def put_provider_secret(name: str, body: ProviderSecretBody, request: Request,
+                        context: AdminContext = Depends(require_admin_session)) -> dict[str, object]:
+    provider_name = _provider_name(name)
+    try:
+        keyring = load_keyring()
+    except CryptoError:
+        raise _key_store_error() from None
+    try:
+        version = store_provider_secret(_database(request), keyring, provider_name,
+                                        body.api_key.get_secret_value(), actor=_actor(request, context))
+    except ValueError:
+        raise AdminApiError(422, "invalid_provider_secret",
+                            "The provider key is empty, too large, or contains whitespace or control characters.",
+                            error_type="invalid_request_error") from None
+    except CryptoError:
+        raise _key_store_error() from None
+    return {"status": "stored", "provider_name": provider_name, "key_version": version}
+
+
+@router.delete("/provider-secrets/{name}")
+def delete_provider_secret_route(name: str, request: Request,
+                                 context: AdminContext = Depends(require_admin_session)) -> dict[str, object]:
+    provider_name = _provider_name(name)
+    if not delete_provider_secret(_database(request), provider_name, actor=_actor(request, context)):
+        raise AdminApiError(404, "provider_secret_not_found", "No stored key has that name.",
+                            error_type="invalid_request_error")
+    return {"status": "deleted", "provider_name": provider_name}
+
+
+@router.post("/provider-secrets/rotate")
+def rotate_provider_secret_keys(request: Request,
+                                context: AdminContext = Depends(require_admin_session)) -> dict[str, object]:
+    try:
+        keyring: Keyring = load_keyring()
+    except CryptoError:
+        raise _key_store_error() from None
+    try:
+        rotated = rotate_provider_secrets(_database(request), keyring, actor=_actor(request, context))
+    except CryptoError:
+        raise AdminApiError(503, "provider_key_rotation_failed",
+                            "Key rotation was not applied. Check the master key configuration.",
+                            error_type="gateway_error") from None
+    return {"rotated": rotated, "key_version": keyring.current.version}
