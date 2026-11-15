@@ -542,3 +542,147 @@ def test_password_policy_rejects_short_or_username_passwords(tmp_path):
         validate_admin_password("Administrator1", "administrator1")
     validate_admin_password(ADMIN_PASSWORD, ADMIN_USER)
     assert hash_admin_password(ADMIN_PASSWORD).startswith("$argon2id$")
+
+
+# 15. Bootstrap: the first administrator can only be created from the local CLI, and only once.
+def _cli(monkeypatch, cfg, argv, stdin_text=None, capsys=None):
+    from app import admin
+
+    monkeypatch.setattr(admin, "load_config", lambda: cfg)
+    monkeypatch.setattr("sys.argv", ["ai-gateway-admin", *argv])
+    if stdin_text is not None:
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+    try:
+        code = admin.main()
+    except SystemExit as exc:
+        code = exc.code
+    output = capsys.readouterr() if capsys is not None else None
+    return code, output
+
+
+def _cfg_for(app):
+    return app.state.gateway_config
+
+
+def test_bootstrap_cli_creates_first_admin_once_and_never_reads_password_from_argv(admin_app, monkeypatch, capsys, tmp_path):
+    app, db = admin_app
+    fresh = Database(str(tmp_path / "bootstrap.sqlite3"))
+    fresh_cfg = replace(_cfg_for(app), settings=replace(_cfg_for(app).settings, database_path=fresh.path))
+
+    code, output = _cli(monkeypatch, fresh_cfg, ["bootstrap-admin", "--username", "owner", "--password-stdin"],
+                        stdin_text=ADMIN_PASSWORD + "\n", capsys=capsys)
+    assert code == 0
+    assert "admin_user_id=1" in output.out
+    assert ADMIN_PASSWORD not in output.out + output.err
+
+    code, output = _cli(monkeypatch, fresh_cfg, ["bootstrap-admin", "--username", "second", "--password-stdin"],
+                        stdin_text=ADMIN_PASSWORD + "\n", capsys=capsys)
+    assert code == 1
+    assert "already exists" in output.out
+    with fresh.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM admin_users").fetchone()[0] == 1
+        assert conn.execute("SELECT action FROM audit_logs").fetchone()[0] == "admin.bootstrap"
+
+
+def test_bootstrap_cli_refuses_non_interactive_use_without_stdin_flag(admin_app, monkeypatch, capsys, tmp_path):
+    app, _db = admin_app
+    fresh = Database(str(tmp_path / "no-tty.sqlite3"))
+    cfg = replace(_cfg_for(app), settings=replace(_cfg_for(app).settings, database_path=fresh.path))
+    code, output = _cli(monkeypatch, cfg, ["bootstrap-admin", "--username", "owner"], stdin_text="", capsys=capsys)
+    assert code == 2
+    assert "terminal" in output.out
+
+
+def test_bootstrap_cli_rejects_weak_password_without_creating_account(admin_app, monkeypatch, capsys, tmp_path):
+    app, _db = admin_app
+    fresh = Database(str(tmp_path / "weak.sqlite3"))
+    cfg = replace(_cfg_for(app), settings=replace(_cfg_for(app).settings, database_path=fresh.path))
+    code, _output = _cli(monkeypatch, cfg, ["bootstrap-admin", "--username", "owner", "--password-stdin"],
+                         stdin_text="short\n", capsys=capsys)
+    assert code == 2
+    with fresh.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM admin_users").fetchone()[0] == 0
+
+
+def test_admin_has_no_http_break_glass_endpoint(admin_app):
+    app, _db = admin_app
+    paths = {getattr(route, "path", "") for route in app.routes}
+    assert not any("break" in path.lower() or "glass" in path.lower() for path in paths)
+
+
+# 16. Break-glass CLI: list, disable, delete, reopen after lockout, and confirmed clear, all audited.
+def test_breakglass_reopens_access_after_allowlist_lockout(admin_app, monkeypatch, capsys):
+    app, db = admin_app
+    cfg = _cfg_for(app)
+    set_rules(db, [("allow", "203.0.113.0/24")])
+    with admin_client(app, ADMIN_IP) as client:
+        assert login(client).status_code == 403
+
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "list"], capsys=capsys)
+    assert code == 0
+    assert "rule_type=allow" in output.out and "203.0.113.0/24" in output.out
+
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "reopen"], capsys=capsys)
+    assert code == 0 and "allow_rules_disabled=1" in output.out
+
+    with admin_client(app, ADMIN_IP) as client:
+        assert login(client).status_code == 200
+
+    actions = [row["action"] for row in audit_rows(db)]
+    assert "breakglass.ip_rules.reopen" in actions
+    reopen_meta = [row["metadata"] for row in audit_rows(db) if row["action"] == "breakglass.ip_rules.reopen"][0]
+    assert '"source":"break-glass-cli"' in reopen_meta
+
+
+def test_breakglass_disable_and_delete_single_rule(admin_app, monkeypatch, capsys):
+    app, db = admin_app
+    cfg = _cfg_for(app)
+    set_rules(db, [("deny", "192.0.2.0/24"), ("deny", "192.0.3.0/24")])
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "disable", "1"], capsys=capsys)
+    assert code == 0 and "disabled" in output.out
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "delete", "2"], capsys=capsys)
+    assert code == 0 and "deleted" in output.out
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "delete", "99"], capsys=capsys)
+    assert code == 1 and "not_found" in output.out
+    with db.connect() as conn:
+        rows = conn.execute("SELECT id, is_active FROM admin_ip_rules").fetchall()
+    assert [(row["id"], row["is_active"]) for row in rows] == [(1, 0)]
+
+
+def test_breakglass_clear_requires_exact_confirmation(admin_app, monkeypatch, capsys):
+    app, db = admin_app
+    cfg = _cfg_for(app)
+    set_rules(db, [("deny", "192.0.2.0/24"), ("deny", "192.0.3.0/24")])
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "clear"], capsys=capsys)
+    assert code == 2 and "refused" in output.out
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "clear", "--confirm", "yes"], capsys=capsys)
+    assert code == 2
+    with db.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM admin_ip_rules").fetchone()[0] == 2
+    code, output = _cli(monkeypatch, cfg, ["ip-rules", "clear", "--confirm", "DELETE-ALL-ADMIN-IP-RULES"], capsys=capsys)
+    assert code == 0 and "deleted=2" in output.out
+    with db.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM admin_ip_rules").fetchone()[0] == 0
+    assert any(row["action"] == "breakglass.ip_rules.clear" for row in audit_rows(db))
+
+
+def test_cli_disable_admin_revokes_sessions_and_blocks_login(admin_app, monkeypatch, capsys):
+    app, db = admin_app
+    cfg = _cfg_for(app)
+    with admin_client(app) as client:
+        assert login(client).status_code == 200
+        token = client.cookies.get(SESSION_COOKIE_NAME)
+    code, output = _cli(monkeypatch, cfg, ["disable-admin", ADMIN_USER], capsys=capsys)
+    assert code == 0 and "disabled" in output.out
+    with db.connect() as conn:
+        assert resolve_session(conn, token, idle_seconds=1800) is None
+    with admin_client(app) as client:
+        assert login(client).status_code == 401
+    code, output = _cli(monkeypatch, cfg, ["enable-admin", ADMIN_USER], capsys=capsys)
+    assert code == 0 and "enabled" in output.out
+    with admin_client(app) as client:
+        assert login(client).status_code == 200
+    code, output = _cli(monkeypatch, cfg, ["revoke-admin-sessions", ADMIN_USER], capsys=capsys)
+    assert code == 0 and "revoked=1" in output.out
