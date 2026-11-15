@@ -8,7 +8,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeVar
@@ -140,23 +140,32 @@ def _dummy_hash() -> str:
         return _dummy_hash_cache
 
 
-def _verify_login_secret(stored_hash: str | None, candidate: str) -> tuple[bool, bool]:
-    """Check one password. Runs in a gate worker thread and returns (matches, needs_rehash)."""
+def _verify_login_secret(stored_hash: str | None, candidate: str) -> tuple[bool, str | None]:
+    """Check one password in a gate worker. Returns (matches, replacement_hash).
+
+    The replacement hash is computed in the same job when the stored hash uses
+    older Argon2 parameters, so each login is admitted to the gate exactly once.
+    A None stored_hash runs the dummy check, so unknown users cost the same.
+    """
     if stored_hash is None:
         verify_admin_password(_dummy_hash(), candidate)
-        return False, False
+        return False, None
     if not verify_admin_password(stored_hash, candidate):
-        return False, False
-    return True, _PASSWORD_HASHER.check_needs_rehash(stored_hash)
+        return False, None
+    if _PASSWORD_HASHER.check_needs_rehash(stored_hash):
+        return True, hash_admin_password(candidate)
+    return True, None
 
 
 class Argon2Gate:
-    """Runs Argon2 work on a bounded thread pool, never on the event loop.
+    """Bounds Argon2 work per worker process: `concurrency` jobs run at once and `queue` more may wait.
 
-    At most `concurrency` hashes run at once in this process. Up to `queue` more
-    may wait. Work beyond that is refused at once with Argon2Busy, so login
-    pressure cannot create unbounded threads or memory use. The limit is per
-    worker process: a server with N workers allows about N * concurrency at once.
+    One counter covers running and waiting jobs, so a job is refused as soon as
+    `concurrency + queue` jobs hold slots. A slot is released when the job's worker
+    future completes, not when the caller stops waiting. A cancelled caller
+    therefore cannot free a slot while its hash is still running. A job cancelled
+    before it starts never runs, and its slot is freed at once. The gate uses no
+    event-loop objects, so it works from any loop.
     """
 
     def __init__(self, concurrency: int = 2, queue: int = 8) -> None:
@@ -164,33 +173,40 @@ class Argon2Gate:
             raise ValueError("Argon2 concurrency must be at least 1 and queue at least 0")
         self._executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="argon2")
         self._capacity = concurrency + queue
-        self._pending = 0
+        self._admitted = 0
         self._lock = threading.Lock()
 
     @property
-    def saturated(self) -> bool:
-        with self._lock:
-            return self._pending >= self._capacity
+    def capacity(self) -> int:
+        return self._capacity
 
-    def _admit(self) -> None:
+    @property
+    def admitted(self) -> int:
+        """Jobs holding a slot: running in a worker thread or waiting for one."""
         with self._lock:
-            if self._pending >= self._capacity:
+            return self._admitted
+
+    def _release(self, _future: object) -> None:
+        with self._lock:
+            self._admitted -= 1
+
+    def _submit(self, func: Callable[..., T], *args: Any) -> Future:
+        with self._lock:
+            if self._admitted >= self._capacity:
                 raise Argon2Busy()
-            self._pending += 1
-
-    def _finished(self, _future: object) -> None:
-        with self._lock:
-            self._pending -= 1
-
-    async def run(self, func: Callable[..., T], *args: Any) -> T:
-        """Admit one job and wait for its result. A cancelled waiter still lets the job finish, and its slot is freed then."""
-        self._admit()
+            self._admitted += 1
         try:
             future = self._executor.submit(func, *args)
         except BaseException:
-            self._finished(None)
+            self._release(None)
             raise
-        future.add_done_callback(self._finished)
+        # Registered before wrap_future, so the slot is already free when the caller resumes.
+        future.add_done_callback(self._release)
+        return future
+
+    async def run(self, func: Callable[..., T], *args: Any) -> T:
+        """Admit one job, or raise Argon2Busy before any work starts, and wait for its result."""
+        future = self._submit(func, *args)
         return await asyncio.wrap_future(future)
 
 
@@ -349,7 +365,9 @@ async def authenticate_admin(
     SQLite work runs in worker threads, and every Argon2 operation runs through
     `gate`. Failures return the same outcome whether the user is unknown, disabled,
     or has a wrong password. The reason is written only to the audit log.
-    Argon2Busy propagates when the gate is full; the reservation is released first.
+    Argon2Busy propagates when the gate refuses admission, before any password check
+    starts, and the reservation is released first. If the request is cancelled after
+    admission, the reservation stays, so that attempt still counts toward the limit.
     """
     current = now_epoch() if now is None else now
     attempt_id, retry_after = await to_thread.run_sync(reserve_login_attempt, db, ip_key, policy, current)
@@ -361,8 +379,9 @@ async def authenticate_admin(
     try:
         user = await to_thread.run_sync(_find_admin_user, db, username)
         stored = str(user["password_hash"]) if user is not None else None
-        password_ok, needs_rehash = await gate.run(_verify_login_secret, stored, password)
-        upgraded_hash = await gate.run(hash_admin_password, password) if (password_ok and needs_rehash) else None
+        # One admission covers the password check and any rehash. A refusal happens
+        # before any Argon2 work starts, so the attempt was never checked.
+        password_ok, upgraded_hash = await gate.run(_verify_login_secret, stored, password)
     except Argon2Busy:
         await to_thread.run_sync(release_login_attempt, db, attempt_id)
         raise
