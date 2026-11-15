@@ -10,6 +10,8 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .admin_routes import AdminApiError, admin_error_handler
+from .admin_routes import router as admin_router
 from .auth import authenticate_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
@@ -87,6 +89,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app.state.database = database
     app.state.http_transport = None
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
+    app.add_exception_handler(AdminApiError, admin_error_handler)
+    app.include_router(admin_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:

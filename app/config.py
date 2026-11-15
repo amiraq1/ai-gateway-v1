@@ -9,7 +9,9 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .ip_access import IPNetwork, parse_ip_or_cidr, parse_trusted_proxies
 from .secret_loader import secret_source_configured
+from .ssrf import validate_provider_endpoint, validate_trusted_networks
 
 
 _PROVIDER_API_KEY_ENV = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_API_KEY\Z")
@@ -33,9 +35,13 @@ class ProviderConfig:
     api_base: str
     api_key_env: str
     enabled: bool = True
+    # Explicit trust for an internal provider. Empty means public HTTPS destinations only.
+    trusted_internal_networks: tuple[IPNetwork, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_provider_api_key_env(self.api_key_env)
+        validate_trusted_networks(self.trusted_internal_networks)
+        validate_provider_endpoint(self.api_base, self.trusted_internal_networks)
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,12 @@ class GatewaySettings:
     provider_timeout_seconds: float
     max_body_bytes: int
     retention_days: int
+    trusted_proxies: tuple[IPNetwork, ...] = ()
+    admin_session_ttl_seconds: int = 28800
+    admin_session_idle_seconds: int = 1800
+    admin_login_max_failures: int = 5
+    admin_login_window_seconds: int = 900
+    admin_allowed_origins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,23 +72,37 @@ class GatewayConfig:
     settings: GatewaySettings
     models: dict[str, ModelConfig]
 
-    def providers_for(self, alias: str) -> list[ProviderConfig]:
+    def providers_for(self, alias: str, stored_names: frozenset[str] = frozenset()) -> list[ProviderConfig]:
+        """Enabled providers whose key is available from env/file or the encrypted store."""
         model = self.models.get(alias)
         if not model or not model.enabled:
             return []
-        return [p for p in model.providers if p.enabled and secret_source_configured(p.api_key_env)]
+        return [
+            p for p in model.providers
+            if p.enabled and (p.api_key_env in stored_names or secret_source_configured(p.api_key_env))
+        ]
 
-    def public_aliases(self) -> list[str]:
-        return sorted(alias for alias in self.models if self.providers_for(alias))
+    def public_aliases(self, stored_names: frozenset[str] = frozenset()) -> list[str]:
+        return sorted(alias for alias in self.models if self.providers_for(alias, stored_names))
 
 
-def _validate_api_base(value: str, provider_name: str) -> str:
-    parts = urlsplit(value)
-    if parts.scheme not in {"https", "http"} or not parts.netloc:
-        raise ValueError(f"Provider {provider_name!r} api_base must be an absolute HTTP(S) URL")
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError(f"Provider {provider_name!r} api_base cannot contain credentials, query, or fragment")
-    return value.rstrip("/")
+def _int_setting(env_name: str, raw_value: Any, low: int, high: int) -> int:
+    value = int(os.environ.get(env_name, raw_value))
+    if not low <= value <= high:
+        raise ValueError(f"{env_name} is outside the allowed range")
+    return value
+
+
+def _origins(raw: str) -> tuple[str, ...]:
+    origins: list[str] = []
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        parts = urlsplit(item)
+        if parts.scheme != "https" or not parts.netloc or parts.path not in {"", "/"} or parts.query or parts.fragment:
+            raise ValueError("ADMIN_ALLOWED_ORIGINS entries must be HTTPS origins")
+        origins.append(f"https://{parts.netloc.lower()}")
+    return tuple(origins)
 
 
 def load_config(path: str | Path | None = None) -> GatewayConfig:
@@ -97,7 +123,28 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     if not 1 <= port <= 65535 or not 1 <= timeout <= 120 or not 1024 <= max_body <= 10_485_760 or not 1 <= retention <= 365:
         raise ValueError("Invalid gateway setting range")
     db_path = os.environ.get("GATEWAY_DATABASE_PATH", str(raw_settings.get("database_path", "/tmp/ai-gateway.sqlite3")))
-    settings = GatewaySettings(host, port, db_path, timeout, max_body, retention)
+
+    raw_proxies = os.environ.get("TRUSTED_PROXIES")
+    if raw_proxies is None:
+        configured = raw_settings.get("trusted_proxies", "")
+        raw_proxies = ",".join(str(item) for item in configured) if isinstance(configured, list) else str(configured)
+    trusted_proxies = parse_trusted_proxies(raw_proxies)
+    allowed_origins = _origins(os.environ.get("ADMIN_ALLOWED_ORIGINS", ",".join(raw_settings.get("admin_allowed_origins", []) or [])))
+
+    settings = GatewaySettings(
+        host,
+        port,
+        db_path,
+        timeout,
+        max_body,
+        retention,
+        trusted_proxies=trusted_proxies,
+        admin_session_ttl_seconds=_int_setting("ADMIN_SESSION_TTL_SECONDS", raw_settings.get("admin_session_ttl_seconds", 28800), 300, 86400),
+        admin_session_idle_seconds=_int_setting("ADMIN_SESSION_IDLE_SECONDS", raw_settings.get("admin_session_idle_seconds", 1800), 60, 86400),
+        admin_login_max_failures=_int_setting("ADMIN_LOGIN_MAX_FAILURES", raw_settings.get("admin_login_max_failures", 5), 1, 100),
+        admin_login_window_seconds=_int_setting("ADMIN_LOGIN_WINDOW_SECONDS", raw_settings.get("admin_login_window_seconds", 900), 60, 86400),
+        admin_allowed_origins=allowed_origins,
+    )
 
     raw_models = raw.get("models", {})
     if not isinstance(raw_models, dict):
@@ -119,7 +166,14 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
             if not name or not model_id or not key_env:
                 raise ValueError(f"Provider for {alias!r} requires name, model, and api_key_env")
             _validate_provider_api_key_env(key_env)
-            api_base = _validate_api_base(str(item.get("api_base", "")), name)
-            providers.append(ProviderConfig(name, model_id, api_base, key_env, bool(item.get("enabled", True))))
+            raw_trust = item.get("trusted_internal_networks", []) or []
+            if not isinstance(raw_trust, list):
+                raise ValueError(f"Provider {name!r} trusted_internal_networks must be a list")
+            trusted = tuple(parse_ip_or_cidr(str(entry_value)) for entry_value in raw_trust)
+            try:
+                providers.append(ProviderConfig(name, model_id, str(item.get("api_base", "")), key_env,
+                                                bool(item.get("enabled", True)), trusted))
+            except ValueError as exc:
+                raise ValueError(f"Provider {name!r}: {exc}") from None
         models[alias] = ModelConfig(alias, bool(entry.get("enabled", True)), tuple(providers))
     return GatewayConfig(settings, models)
