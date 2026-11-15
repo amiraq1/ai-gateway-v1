@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
 import hashlib
 import io
 import ipaddress
 import json
 import os
 import secrets as stdlib_secrets
+import ssl
 import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 
 from app import admin
@@ -1246,3 +1252,78 @@ def test_streaming_and_non_streaming_v1_work_through_the_pinned_transport(tmp_pa
     assert streamed.status_code == 200
     assert streamed.headers["content-type"].startswith("text/event-stream")
     assert "data: [DONE]" in streamed.text
+
+
+def _write_tls_material(directory, dns_name: str):
+    """Create a throwaway CA and one leaf certificate for dns_name at test runtime. Nothing is committed."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "synthetic test ca")])
+    ca_cert = (
+        x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+        .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, dns_name)]))
+        .issuer_name(ca_name).public_key(leaf_key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(dns_name)]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_path = directory / "ca.pem"
+    cert_path = directory / f"{dns_name}.crt"
+    key_path = directory / f"{dns_name}.key"
+    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    cert_path.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(leaf_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                serialization.NoEncryption()))
+    return ca_path, cert_path, key_path
+
+
+def test_tls_verifies_the_original_hostname_when_connecting_to_a_validated_ip(tmp_path, monkeypatch):
+    ca_path, cert_path, key_path = _write_tls_material(tmp_path, "secure.test")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_path))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderHandler)
+    server.seen = []
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        resolver = _resolve_with({"secure.test": ["127.0.0.1"]})
+        trusted = (ipaddress.ip_network("127.0.0.0/8"),)
+        response = asyncio.run(_post_through_transport("secure.test", resolver, scheme="https", port=port, trusted=trusted))
+        assert response.status_code == 200
+        assert server.seen[0]["host"] == f"secure.test:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_tls_handshake_fails_when_certificate_does_not_name_the_requested_host(tmp_path, monkeypatch):
+    ca_path, cert_path, key_path = _write_tls_material(tmp_path, "other.test")
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_path))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderHandler)
+    server.seen = []
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        resolver = _resolve_with({"secure.test": ["127.0.0.1"]})
+        trusted = (ipaddress.ip_network("127.0.0.0/8"),)
+        with pytest.raises(httpx.ConnectError):
+            asyncio.run(_post_through_transport("secure.test", resolver, scheme="https", port=port, trusted=trusted))
+        assert server.seen == []
+    finally:
+        server.shutdown()
+        server.server_close()
