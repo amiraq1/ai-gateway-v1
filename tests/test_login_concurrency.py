@@ -113,8 +113,8 @@ def test_login_beyond_capacity_is_refused_without_recording_a_failed_attempt(tmp
 def test_login_pressure_keeps_sse_and_healthz_responsive(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
     monkeypatch.setenv("SLOW_STUB_API_KEY", "synthetic-slow-stub-key")
-    with serve_slow_provider() as provider_port:
-        provider = ProviderConfig("slow", "stub-model", f"http://127.0.0.1:{provider_port}/v1",
+    with serve_slow_provider() as slow:
+        provider = ProviderConfig("slow", "stub-model", f"http://127.0.0.1:{slow.port}/v1",
                                   "SLOW_STUB_API_KEY", True,
                                   trusted_internal_networks=(ipaddress.ip_network("127.0.0.0/8"),))
         app, db = build_gateway_app(tmp_path, providers=[provider], admin_login_max_failures=100)

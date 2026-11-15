@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .admin_routes import AdminApiError, admin_error_handler
 from .admin_routes import router as admin_router
 from .auth import Argon2Gate, authenticate_key, make_request_log
+from .chat_routes import chat_router
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
@@ -84,6 +85,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
     app.add_exception_handler(AdminApiError, admin_error_handler)
     app.include_router(admin_router)
+    app.include_router(chat_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:

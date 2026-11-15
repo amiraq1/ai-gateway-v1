@@ -79,7 +79,8 @@ def _provider_body(base_payload: dict[str, Any], provider: ProviderConfig) -> di
     return body
 
 
-def _safe_error_event(code: str) -> bytes:
+def safe_error_event(code: str) -> bytes:
+    """One SSE error event with a fixed message. The provider's own error text is never forwarded."""
     data = json.dumps({"error": {"message": "The upstream stream failed.", "type": "gateway_error", "code": code}}, separators=(",", ":"))
     return f"event: error\ndata: {data}\n\n".encode("utf-8")
 
@@ -172,23 +173,23 @@ async def stream_completion(providers: list[ProviderConfig], base_payload: dict[
                                 continue
                             outcome.error_category = "provider_unavailable"
                             outcome.final_status = 502
-                            yield StreamEvent(_safe_error_event(outcome.error_category))
+                            yield StreamEvent(safe_error_event(outcome.error_category))
                             return
                         if response.status_code in {401, 403}:
                             outcome.error_category = "provider_authentication"
                             outcome.final_status = 502
-                            yield StreamEvent(_safe_error_event(outcome.error_category))
+                            yield StreamEvent(safe_error_event(outcome.error_category))
                             return
                         if response.status_code < 200 or response.status_code >= 300:
                             outcome.error_category = "provider_rejected_request"
                             outcome.final_status = 502
-                            yield StreamEvent(_safe_error_event(outcome.error_category))
+                            yield StreamEvent(safe_error_event(outcome.error_category))
                             return
                         content_type = response.headers.get("content-type", "").lower()
                         if "text/event-stream" not in content_type:
                             outcome.error_category = "provider_malformed_stream"
                             outcome.final_status = 502
-                            yield StreamEvent(_safe_error_event(outcome.error_category))
+                            yield StreamEvent(safe_error_event(outcome.error_category))
                             return
                         async for line in response.aiter_lines():
                             if time.monotonic() > deadline:
@@ -236,26 +237,26 @@ async def stream_completion(providers: list[ProviderConfig], base_payload: dict[
                     continue
                 outcome.error_category = "provider_destination_blocked"
                 outcome.final_status = 502
-                yield StreamEvent(_safe_error_event(outcome.error_category))
+                yield StreamEvent(safe_error_event(outcome.error_category))
                 return
             except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
                 if not emitted and index + 1 < len(attempt_providers):
                     continue
                 outcome.error_category = "provider_stream_failure"
                 outcome.final_status = 502
-                yield StreamEvent(_safe_error_event(outcome.error_category))
+                yield StreamEvent(safe_error_event(outcome.error_category))
                 return
             except ProviderFailure as failure:
                 if failure.retryable and not emitted and index + 1 < len(attempt_providers):
                     continue
                 outcome.error_category = failure.category
                 outcome.final_status = failure.status_code
-                yield StreamEvent(_safe_error_event(outcome.error_category))
+                yield StreamEvent(safe_error_event(outcome.error_category))
                 return
         if not outcome.completed and outcome.error_category is None:
             outcome.error_category = "provider_unavailable"
             outcome.final_status = 502
-            yield StreamEvent(_safe_error_event(outcome.error_category))
+            yield StreamEvent(safe_error_event(outcome.error_category))
     except asyncio.CancelledError:
         outcome.error_category = "client_disconnected"
         outcome.final_status = 499

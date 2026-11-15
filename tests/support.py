@@ -100,12 +100,21 @@ def serve_https(app, directory: Path) -> Iterator[tuple[str, ssl.SSLContext]]:
         thread.join(timeout=15)
 
 
+class SlowProvider:
+    """Handle for the streaming stub: its port and the number of requests it has received."""
+
+    def __init__(self, port: int, hits: list[str]) -> None:
+        self.port = port
+        self.hits = hits
+
+
 class _SlowProviderHandler(BaseHTTPRequestHandler):
     """OpenAI-style SSE stub that sends ten chunks, 100 ms apart."""
 
     def do_POST(self) -> None:  # noqa: N802 - http.server naming
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
+        self.server.hits.append(self.path)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -122,12 +131,13 @@ class _SlowProviderHandler(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def serve_slow_provider() -> Iterator[int]:
+def serve_slow_provider() -> Iterator[SlowProvider]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _SlowProviderHandler)
+    server.hits = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield server.server_address[1]
+        yield SlowProvider(server.server_address[1], server.hits)
     finally:
         server.shutdown()
         server.server_close()
