@@ -49,6 +49,7 @@ from app.provider_secrets import (
     store_provider_secret,
 )
 from app.sessions import (
+    CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
     create_session,
     resolve_session,
@@ -215,11 +216,9 @@ def test_successful_login_sets_hardened_cookie_and_records_last_login(admin_app)
     assert body["username"] == ADMIN_USER
     assert body["csrf_token"]
     assert "token" not in body
-    cookie_header = response.headers["set-cookie"].lower()
-    assert "httponly" in cookie_header
-    assert "secure" in cookie_header
-    assert "samesite=lax" in cookie_header
-    assert "path=/api/admin" in cookie_header
+    attrs = cookie_attributes(set_cookie_headers(response)[SESSION_COOKIE_NAME])
+    assert attrs["httponly"] is True and attrs["secure"] is True
+    assert attrs["samesite"].lower() == "lax" and attrs["path"] == "/api"
     assert response.headers["cache-control"] == "no-store"
     with db.connect() as conn:
         assert conn.execute("SELECT last_login_at FROM admin_users").fetchone()[0] is not None
@@ -280,15 +279,91 @@ def test_csrf_token_is_required_and_verified_on_state_changes(admin_app):
         assert delete_wrong.status_code == 403
 
 
-def test_csrf_token_rotates_on_session_read_and_old_value_stops_working(admin_app):
+def cookie_attributes(set_cookie_header: str) -> dict[str, object]:
+    """Parse the attributes of one Set-Cookie header. Bare flags map to True."""
+    attributes: dict[str, object] = {}
+    for part in set_cookie_header.split(";")[1:]:
+        name, _, value = part.strip().partition("=")
+        attributes[name.lower()] = value if value else True
+    return attributes
+
+
+def set_cookie_headers(response) -> dict[str, str]:
+    """Map each cookie name in a response to its full Set-Cookie header."""
+    return {raw.split("=", 1)[0]: raw for raw in response.headers.get_list("set-cookie")}
+
+
+def test_csrf_cookie_is_scoped_to_api_and_readable_by_the_ui(admin_app):
+    app, _db = admin_app
+    with admin_client(app) as client:
+        response = login(client)
+    cookies = set_cookie_headers(response)
+    session_attrs = cookie_attributes(cookies[SESSION_COOKIE_NAME])
+    csrf_attrs = cookie_attributes(cookies[CSRF_COOKIE_NAME])
+    for attrs in (session_attrs, csrf_attrs):
+        assert attrs["path"] == "/api" and attrs["secure"] is True
+        assert attrs["samesite"].lower() == "lax"
+    assert session_attrs["httponly"] is True
+    assert csrf_attrs.get("httponly") is None
+
+
+def test_session_cookie_is_sent_to_admin_and_chat_paths_but_not_v1(admin_app):
+    app, _db = admin_app
+    with admin_client(app) as client:
+        response = login(client)
+    jar = httpx.Cookies()
+    jar.extract_cookies(response)
+    for url, expected in (("https://testserver/api/admin/session", True),
+                          ("https://testserver/api/chat/conversations", True),
+                          ("https://testserver/v1/models", False)):
+        request = httpx.Request("GET", url)
+        jar.set_cookie_header(request)
+        assert (SESSION_COOKIE_NAME in request.headers.get("cookie", "")) is expected, url
+
+
+def test_csrf_token_is_stable_across_reads_and_reloads(admin_app):
     app, _db = admin_app
     with admin_client(app) as client:
         login_csrf = login(client).json()["csrf_token"]
-        new_csrf = client.get("/api/admin/session").json()["csrf_token"]
-        assert new_csrf != login_csrf
-        old = client.post("/api/admin/ip-rules", headers={"X-CSRF-Token": login_csrf},
-                          json={"rule_type": "allow", "ip_or_cidr": "198.51.100.0/24"})
-        assert old.status_code == 403
+        first = client.get("/api/admin/session")
+        second = client.get("/api/admin/session")
+        assert first.json()["csrf_token"] == second.json()["csrf_token"] == login_csrf
+        assert CSRF_COOKIE_NAME not in set_cookie_headers(first)
+        assert client.post("/api/admin/ip-rules", headers={"X-CSRF-Token": login_csrf},
+                           json={"rule_type": "allow", "ip_or_cidr": "198.51.100.0/24"}).status_code == 201
+        with admin_client(app) as reloaded:
+            reloaded.cookies = client.cookies
+            assert reloaded.get("/api/admin/session").json()["csrf_token"] == login_csrf
+
+
+def test_two_tabs_share_one_csrf_token_and_neither_invalidates_the_other(admin_app):
+    app, _db = admin_app
+    with admin_client(app) as tab_a:
+        csrf = login(tab_a).json()["csrf_token"]
+        with admin_client(app) as tab_b:
+            tab_b.cookies = tab_a.cookies
+            assert tab_a.get("/api/admin/session").json()["csrf_token"] == csrf
+            assert tab_b.get("/api/admin/session").json()["csrf_token"] == csrf
+            first = tab_a.post("/api/admin/ip-rules", headers={"X-CSRF-Token": csrf},
+                               json={"rule_type": "allow", "ip_or_cidr": "198.51.100.0/24"})
+            second = tab_b.post("/api/admin/ip-rules", headers={"X-CSRF-Token": csrf},
+                                json={"rule_type": "allow", "ip_or_cidr": "203.0.113.0/24"})
+            assert first.status_code == 201 and second.status_code == 201
+            assert tab_a.get("/api/admin/session").json()["csrf_token"] == csrf
+
+
+def test_missing_csrf_cookie_issues_a_new_token_and_invalidates_the_old_one(admin_app):
+    app, _db = admin_app
+    with admin_client(app) as client:
+        old_csrf = login(client).json()["csrf_token"]
+        client.cookies.delete(CSRF_COOKIE_NAME)
+        response = client.get("/api/admin/session")
+        new_csrf = response.json()["csrf_token"]
+        assert new_csrf != old_csrf
+        assert CSRF_COOKIE_NAME in set_cookie_headers(response)
+        stale = client.post("/api/admin/ip-rules", headers={"X-CSRF-Token": old_csrf},
+                            json={"rule_type": "allow", "ip_or_cidr": "198.51.100.0/24"})
+        assert stale.status_code == 403
         current = client.post("/api/admin/ip-rules", headers={"X-CSRF-Token": new_csrf},
                               json={"rule_type": "allow", "ip_or_cidr": "198.51.100.0/24"})
         assert current.status_code == 201
@@ -521,13 +596,22 @@ def test_admin_health_reports_schema_version_for_authenticated_admins(admin_app)
     assert response.json()["schema_version"] >= 2
 
 
-def test_logout_clears_cookie_and_writes_audit(admin_app):
+def test_logout_clears_both_cookies_and_the_csrf_token_stops_working(admin_app):
     app, db = admin_app
     with admin_client(app) as client:
         csrf = login(client).json()["csrf_token"]
+        token = client.cookies.get(SESSION_COOKIE_NAME)
         response = client.post("/api/admin/logout", headers={"X-CSRF-Token": csrf})
         assert response.status_code == 200
-        assert "amnabd_admin_session=\"\"" in response.headers["set-cookie"] or "Max-Age=0" in response.headers["set-cookie"]
+        cleared = set_cookie_headers(response)
+        for name in (SESSION_COOKIE_NAME, CSRF_COOKIE_NAME):
+            assert cookie_attributes(cleared[name]).get("max-age") == "0"
+        assert client.cookies.get(CSRF_COOKIE_NAME) is None
+        client.cookies.set(SESSION_COOKIE_NAME, token)
+        client.cookies.set(CSRF_COOKIE_NAME, csrf)
+        assert client.get("/api/admin/session").status_code == 401
+        assert client.post("/api/admin/ip-rules", headers={"X-CSRF-Token": csrf},
+                           json={"rule_type": "allow", "ip_or_cidr": "198.51.100.0/24"}).status_code == 401
     assert any(row["action"] == "admin.logout" for row in audit_rows(db))
 
 

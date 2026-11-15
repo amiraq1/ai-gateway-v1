@@ -16,7 +16,9 @@ from typing import Any
 from .clock import now_epoch
 
 SESSION_COOKIE_NAME = "amnabd_admin_session"
-SESSION_COOKIE_PATH = "/api/admin"
+CSRF_COOKIE_NAME = "amnabd_csrf_token"
+# /api covers the admin routes (/api/admin/*) and the chat routes (/api/chat/*).
+SESSION_COOKIE_PATH = "/api"
 TOKEN_BYTES = 32  # 256 bits of randomness per token
 LAST_SEEN_WRITE_INTERVAL_SECONDS = 60
 _MAX_PRESENTED_TOKEN_LENGTH = 128
@@ -118,16 +120,22 @@ def resolve_session(
     )
 
 
-def rotate_csrf_token(conn: sqlite3.Connection, session_id: int) -> str:
-    """Replace a session's CSRF token and return the new raw value.
+def csrf_token_for_session(conn: sqlite3.Connection, record: SessionRecord,
+                           presented_cookie: str | None) -> tuple[str, bool]:
+    """Return the CSRF token bound to this session as (token, issued_new).
 
-    The raw value is returned to the authenticated caller only. Earlier CSRF
-    tokens for this session stop working after rotation.
+    Only the hash is stored. A presented cookie is accepted when its hash equals
+    the stored hash, and it is returned unchanged without a write. Only a missing
+    or non-matching cookie replaces the stored hash, so a normal GET never
+    invalidates a token that another tab is using.
     """
+    if (presented_cookie and len(presented_cookie) <= _MAX_PRESENTED_CSRF_LENGTH
+            and hmac.compare_digest(hash_token(presented_cookie), record.csrf_token_hash)):
+        return presented_cookie, False
     csrf_token = secrets.token_urlsafe(TOKEN_BYTES)
     conn.execute("UPDATE user_sessions SET csrf_token_hash = ? WHERE id = ? AND revoked_at IS NULL",
-                 (hash_token(csrf_token), session_id))
-    return csrf_token
+                 (hash_token(csrf_token), record.session_id))
+    return csrf_token, True
 
 
 def verify_csrf_token(record: SessionRecord, presented: str | None) -> bool:
@@ -156,5 +164,15 @@ SESSION_COOKIE_OPTIONS: dict[str, Any] = {
     "path": SESSION_COOKIE_PATH,
     "secure": True,
     "httponly": True,
+    "samesite": "lax",
+}
+
+# The UI reads this cookie to send X-CSRF-Token, so it is not HttpOnly. A readable
+# value cannot be used alone: writes are accepted only when the header matches the
+# hash stored in SQLite for the session.
+CSRF_COOKIE_OPTIONS: dict[str, Any] = {
+    "path": SESSION_COOKIE_PATH,
+    "secure": True,
+    "httponly": False,
     "samesite": "lax",
 }

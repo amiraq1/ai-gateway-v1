@@ -24,12 +24,14 @@ from .database import Database
 from .ip_access import IpRule, IPAddress, is_request_allowed, parse_ip_or_cidr, resolve_client_ip
 from .migrations import read_schema_version
 from .sessions import (
+    CSRF_COOKIE_NAME,
+    CSRF_COOKIE_OPTIONS,
     SESSION_COOKIE_NAME,
     SESSION_COOKIE_OPTIONS,
     SessionRecord,
+    csrf_token_for_session,
     resolve_session,
     revoke_session,
-    rotate_csrf_token,
     verify_csrf_token,
 )
 
@@ -181,6 +183,8 @@ def admin_login(body: LoginBody, request: Request) -> JSONResponse:
     )
     response.set_cookie(SESSION_COOKIE_NAME, issued.token, max_age=settings.admin_session_ttl_seconds,
                         **SESSION_COOKIE_OPTIONS)
+    response.set_cookie(CSRF_COOKIE_NAME, issued.csrf_token, max_age=settings.admin_session_ttl_seconds,
+                        **CSRF_COOKIE_OPTIONS)
     return response
 
 
@@ -194,15 +198,22 @@ def admin_logout(request: Request, context: AdminContext = Depends(require_admin
                            ip_address=ip_text, user_agent=user_agent, now=now_epoch())
     response = JSONResponse({"status": "logged_out"}, headers=_NO_STORE)
     response.delete_cookie(SESSION_COOKIE_NAME, **SESSION_COOKIE_OPTIONS)
+    response.delete_cookie(CSRF_COOKIE_NAME, **CSRF_COOKIE_OPTIONS)
     return response
 
 
 @router.get("/session")
 def admin_session(request: Request, context: AdminContext = Depends(require_admin_session)) -> JSONResponse:
-    """Return session state and a fresh CSRF token. Each call replaces the previous CSRF token."""
-    with _database(request).transaction() as conn:
-        csrf_token = rotate_csrf_token(conn, context.session.session_id)
-    return JSONResponse(
+    """Return session state and the CSRF token bound to this session.
+
+    While the CSRF cookie matches the stored hash, the same token is returned, so
+    several tabs of one browser keep working. A new token is issued only when the
+    cookie is missing or does not match.
+    """
+    with _database(request).connect() as conn:
+        csrf_token, issued_new = csrf_token_for_session(conn, context.session,
+                                                        request.cookies.get(CSRF_COOKIE_NAME))
+    response = JSONResponse(
         {
             "authenticated": True,
             "username": context.session.username,
@@ -212,6 +223,10 @@ def admin_session(request: Request, context: AdminContext = Depends(require_admi
         },
         headers=_NO_STORE,
     )
+    if issued_new:
+        remaining = max(1, context.session.expires_at - now_epoch())
+        response.set_cookie(CSRF_COOKIE_NAME, csrf_token, max_age=remaining, **CSRF_COOKIE_OPTIONS)
+    return response
 
 
 @router.get("/health")
