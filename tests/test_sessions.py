@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
-import sqlite3
+import io
+import ipaddress
+import json
+import os
+import secrets as stdlib_secrets
+import threading
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app import admin
+from app.audit import record_audit_event
 from app.auth import (
     LoginPolicy,
     authenticate_admin,
@@ -16,20 +26,30 @@ from app.auth import (
     hash_admin_password,
     reserve_login_attempt,
     set_admin_user_active,
+    validate_admin_password,
     verify_admin_password,
 )
 from app.config import GatewayConfig, GatewaySettings, ModelConfig, ProviderConfig
+from app.crypto import CryptoError, load_keyring, parse_master_key
 from app.database import Database
 from app.ip_access import IpRule, is_request_allowed, parse_ip_or_cidr, parse_trusted_proxies, resolve_client_ip
 from app.main import create_app
+from app.provider_secrets import (
+    delete_provider_secret,
+    list_provider_secrets,
+    provider_secret_names,
+    resolve_provider_api_key,
+    rotate_provider_secrets,
+    store_provider_secret,
+)
 from app.sessions import (
     SESSION_COOKIE_NAME,
     create_session,
     resolve_session,
-    revoke_session,
     revoke_user_sessions,
     verify_csrf_token,
 )
+from app.ssrf import DestinationBlockedError, EgressPolicy, PinnedDestinationTransport, classify_address, validate_provider_endpoint
 from tests.test_api import success_handler
 
 PEPPER = "test-pepper-that-is-at-least-32-bytes-long"
@@ -520,8 +540,6 @@ def test_ip_rule_changes_are_audited_without_secrets(admin_app):
 
 
 def test_audit_metadata_refuses_credential_like_keys(tmp_path):
-    from app.audit import record_audit_event
-
     db = Database(str(tmp_path / "audit-keys.sqlite3"))
     db.init()
     with db.transaction() as conn:
@@ -533,9 +551,7 @@ def test_audit_metadata_refuses_credential_like_keys(tmp_path):
             record_audit_event(conn, action="bad action!")
 
 
-def test_password_policy_rejects_short_or_username_passwords(tmp_path):
-    from app.auth import validate_admin_password
-
+def test_password_policy_rejects_short_or_username_passwords():
     with pytest.raises(ValueError):
         validate_admin_password("short", ADMIN_USER)
     with pytest.raises(ValueError):
@@ -546,13 +562,9 @@ def test_password_policy_rejects_short_or_username_passwords(tmp_path):
 
 # 15. Bootstrap: the first administrator can only be created from the local CLI, and only once.
 def _cli(monkeypatch, cfg, argv, stdin_text=None, capsys=None):
-    from app import admin
-
     monkeypatch.setattr(admin, "load_config", lambda: cfg)
     monkeypatch.setattr("sys.argv", ["ai-gateway-admin", *argv])
     if stdin_text is not None:
-        import io
-
         monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
     try:
         code = admin.main()
@@ -686,3 +698,551 @@ def test_cli_disable_admin_revokes_sessions_and_blocks_login(admin_app, monkeypa
         assert login(client).status_code == 200
     code, output = _cli(monkeypatch, cfg, ["revoke-admin-sessions", ADMIN_USER], capsys=capsys)
     assert code == 0 and "revoked=1" in output.out
+
+
+# 17. Provider key encryption: AES-256-GCM, fresh nonces, tamper and binding checks, rotation, and fail-closed behavior.
+PROVIDER_KEY = "synthetic-provider-key-value-7731"  # test marker, not a credential
+
+
+def _random_master_key() -> str:
+    return base64.b64encode(stdlib_secrets.token_bytes(32)).decode("ascii")
+
+
+@pytest.fixture
+def master_env(monkeypatch):
+    monkeypatch.setenv("GATEWAY_MASTER_KEY", _random_master_key())
+    monkeypatch.delenv("GATEWAY_MASTER_KEY_VERSION", raising=False)
+    monkeypatch.delenv("GATEWAY_MASTER_KEY_PREVIOUS", raising=False)
+    monkeypatch.delenv("GATEWAY_MASTER_KEY_PREVIOUS_VERSION", raising=False)
+    monkeypatch.delenv("GATEWAY_MASTER_KEY_FILE", raising=False)
+    monkeypatch.delenv("GATEWAY_MASTER_KEY_PREVIOUS_FILE", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY_FILE", raising=False)
+    return monkeypatch
+
+
+def _fresh_db(tmp_path, name="secrets.sqlite3") -> Database:
+    db = Database(str(tmp_path / name))
+    db.init()
+    return db
+
+
+def test_provider_key_is_stored_encrypted_and_round_trips(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    keyring = load_keyring()
+    assert store_provider_secret(db, keyring, "OPENAI_API_KEY", PROVIDER_KEY) == 1
+    assert PROVIDER_KEY.encode() not in db_bytes(db)
+    with db.connect() as conn:
+        row = conn.execute("SELECT algorithm, length(nonce) AS nonce_len, ciphertext FROM provider_secrets").fetchone()
+    assert row["algorithm"] == "AES-256-GCM"
+    assert row["nonce_len"] == 12
+    assert PROVIDER_KEY.encode() not in bytes(row["ciphertext"])
+    assert resolve_provider_api_key(db, "OPENAI_API_KEY") == PROVIDER_KEY
+
+
+def test_every_seal_uses_a_fresh_nonce(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    keyring = load_keyring()
+    store_provider_secret(db, keyring, "OPENAI_API_KEY", PROVIDER_KEY)
+    with db.connect() as conn:
+        first = tuple(bytes(x) for x in conn.execute("SELECT nonce, ciphertext FROM provider_secrets").fetchone())
+    store_provider_secret(db, keyring, "OPENAI_API_KEY", PROVIDER_KEY)
+    with db.connect() as conn:
+        second = tuple(bytes(x) for x in conn.execute("SELECT nonce, ciphertext FROM provider_secrets").fetchone())
+    assert first[0] != second[0]
+    assert first[1] != second[1]
+
+
+def test_tampered_ciphertext_fails_closed(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    with db.connect() as conn:
+        ciphertext = bytearray(conn.execute("SELECT ciphertext FROM provider_secrets").fetchone()[0])
+        ciphertext[0] ^= 0x01
+        conn.execute("UPDATE provider_secrets SET ciphertext = ?", (bytes(ciphertext),))
+    with pytest.raises(CryptoError, match="integrity"):
+        resolve_provider_api_key(db, "OPENAI_API_KEY")
+
+
+def test_ciphertext_cannot_be_moved_to_another_provider_name(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    with db.connect() as conn:
+        conn.execute("UPDATE provider_secrets SET provider_name = 'ANTHROPIC_API_KEY'")
+    with pytest.raises(CryptoError):
+        resolve_provider_api_key(db, "ANTHROPIC_API_KEY")
+
+
+def test_master_key_is_never_written_to_the_database(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    key_text = os.environ["GATEWAY_MASTER_KEY"]
+    assert key_text.encode() not in db_bytes(db)
+    assert base64.b64decode(key_text) not in db_bytes(db)
+
+
+@pytest.mark.parametrize("bad_key", ["", "c2hvcnQ=", "not base64 at all!!", "A" * 44])
+def test_invalid_master_keys_are_refused(bad_key, master_env):
+    master_env.setenv("GATEWAY_MASTER_KEY", bad_key)
+    with pytest.raises(CryptoError):
+        load_keyring()
+
+
+def test_missing_master_key_and_bad_version_fail_closed(tmp_path, master_env):
+    master_env.delenv("GATEWAY_MASTER_KEY")
+    with pytest.raises(CryptoError, match="unavailable"):
+        load_keyring()
+    master_env.setenv("GATEWAY_MASTER_KEY", _random_master_key())
+    master_env.setenv("GATEWAY_MASTER_KEY_VERSION", "zero")
+    with pytest.raises(CryptoError, match="version"):
+        load_keyring()
+
+
+def test_wrong_master_key_cannot_open_stored_keys(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    master_env.setenv("GATEWAY_MASTER_KEY", _random_master_key())
+    with pytest.raises(CryptoError):
+        resolve_provider_api_key(db, "OPENAI_API_KEY")
+
+
+def test_master_key_can_be_read_from_a_protected_file(tmp_path, master_env, secret_directory):
+    key_text = _random_master_key()
+    key_file = secret_directory / "master-key"
+    key_file.write_bytes(key_text.encode("ascii"))
+    key_file.chmod(0o400)
+    master_env.delenv("GATEWAY_MASTER_KEY")
+    master_env.setenv("GATEWAY_MASTER_KEY_FILE", str(key_file))
+    keyring = load_keyring()
+    assert keyring.current.version == 1
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, keyring, "OPENAI_API_KEY", PROVIDER_KEY)
+    assert resolve_provider_api_key(db, "OPENAI_API_KEY") == PROVIDER_KEY
+
+
+def test_rotation_reencrypts_to_new_version_then_old_key_can_be_removed(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    old_key = os.environ["GATEWAY_MASTER_KEY"]
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+
+    master_env.setenv("GATEWAY_MASTER_KEY", _random_master_key())
+    master_env.setenv("GATEWAY_MASTER_KEY_VERSION", "2")
+    master_env.setenv("GATEWAY_MASTER_KEY_PREVIOUS", old_key)
+    master_env.setenv("GATEWAY_MASTER_KEY_PREVIOUS_VERSION", "1")
+    keyring = load_keyring()
+    assert resolve_provider_api_key(db, "OPENAI_API_KEY") == PROVIDER_KEY
+    assert rotate_provider_secrets(db, keyring) == 1
+    assert [info.key_version for info in list_provider_secrets(db)] == [2]
+
+    master_env.delenv("GATEWAY_MASTER_KEY_PREVIOUS")
+    master_env.delenv("GATEWAY_MASTER_KEY_PREVIOUS_VERSION")
+    assert resolve_provider_api_key(db, "OPENAI_API_KEY") == PROVIDER_KEY
+
+
+def test_rotation_is_all_or_nothing(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    old_key = os.environ["GATEWAY_MASTER_KEY"]
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    store_provider_secret(db, load_keyring(), "ANTHROPIC_API_KEY", "synthetic-second-key-value")
+    with db.transaction() as conn:
+        # A row whose key version no longer exists makes the whole rotation fail.
+        conn.execute("UPDATE provider_secrets SET key_version = 9 WHERE provider_name = 'ANTHROPIC_API_KEY'")
+    master_env.setenv("GATEWAY_MASTER_KEY", _random_master_key())
+    master_env.setenv("GATEWAY_MASTER_KEY_VERSION", "2")
+    master_env.setenv("GATEWAY_MASTER_KEY_PREVIOUS", old_key)
+    master_env.setenv("GATEWAY_MASTER_KEY_PREVIOUS_VERSION", "1")
+    with pytest.raises(CryptoError):
+        rotate_provider_secrets(db, load_keyring())
+    versions = {info.provider_name: info.key_version for info in list_provider_secrets(db)}
+    assert versions == {"ANTHROPIC_API_KEY": 9, "OPENAI_API_KEY": 1}
+    assert resolve_provider_api_key(db, "OPENAI_API_KEY") == PROVIDER_KEY
+
+
+def test_stored_key_and_env_source_together_are_refused(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    master_env.setenv("OPENAI_API_KEY", "synthetic-env-key-value")
+    with pytest.raises(CryptoError, match="more than one"):
+        resolve_provider_api_key(db, "OPENAI_API_KEY")
+
+
+def test_store_rejects_bad_names_and_values_without_echoing_them(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    keyring = load_keyring()
+    with pytest.raises(ValueError) as captured:
+        store_provider_secret(db, keyring, "GATEWAY_PEPPER", PROVIDER_KEY)
+    assert PROVIDER_KEY not in str(captured.value)
+    with pytest.raises(ValueError):
+        store_provider_secret(db, keyring, "OPENAI_API_KEY", "has space inside")
+    with pytest.raises(ValueError):
+        store_provider_secret(db, keyring, "OPENAI_API_KEY", "")
+    assert provider_secret_names(db) == frozenset()
+
+
+def test_store_list_and_delete_never_expose_values(tmp_path, master_env):
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    listing = list_provider_secrets(db)
+    assert [info.provider_name for info in listing] == ["OPENAI_API_KEY"]
+    assert PROVIDER_KEY not in repr(listing)
+    assert delete_provider_secret(db, "OPENAI_API_KEY")
+    assert not delete_provider_secret(db, "OPENAI_API_KEY")
+
+
+@pytest.mark.parametrize(("text", "length"), [
+    ("A" * 64, 32),
+    (base64.b64encode(bytes(range(32))).decode(), 32),
+    (base64.urlsafe_b64encode(bytes(range(32, 64))).decode().rstrip("="), 32),
+])
+def test_master_key_formats_hex_and_base64_are_accepted(text, length):
+    assert len(parse_master_key(text)) == length
+
+
+@pytest.mark.parametrize("text", ["A" * 62, base64.b64encode(bytes(31)).decode(), "@@@@"])
+def test_master_key_wrong_length_or_garbage_is_refused(text):
+    with pytest.raises(CryptoError):
+        parse_master_key(text)
+
+
+def test_provider_request_uses_stored_key_without_env_and_never_echoes_it(tmp_path, master_env, caplog):
+    master_env.setenv("GATEWAY_PEPPER", PEPPER)
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    seen = []
+    app, db = _route_app(tmp_path, [ProviderConfig("stored", "m1", "https://stored.example/v1", "OPENAI_API_KEY", True)],
+                         _static_resolver({"stored.example": ["93.184.216.34"]}), db=db)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["authorization"])
+        return success_handler(request)
+
+    app.state.http_transport = httpx.MockTransport(handler)
+    token = create_client_key(db, PEPPER, "stored-key", 20)[1]
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                               json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200
+    assert seen == [f"Bearer {PROVIDER_KEY}"]
+    assert PROVIDER_KEY not in response.text
+    assert PROVIDER_KEY not in caplog.text
+
+
+def test_missing_master_key_returns_503_without_contacting_provider(tmp_path, master_env):
+    master_env.setenv("GATEWAY_PEPPER", PEPPER)
+    db = _fresh_db(tmp_path)
+    store_provider_secret(db, load_keyring(), "OPENAI_API_KEY", PROVIDER_KEY)
+    master_env.delenv("GATEWAY_MASTER_KEY")
+    app, db = _route_app(tmp_path, [ProviderConfig("stored", "m1", "https://stored.example/v1", "OPENAI_API_KEY", True)],
+                         _static_resolver({"stored.example": ["93.184.216.34"]}), db=db)
+    calls = []
+    app.state.http_transport = httpx.MockTransport(lambda request: calls.append(request) or success_handler(request))
+    token = create_client_key(db, PEPPER, "missing-master", 20)[1]
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                               json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]})
+    assert calls == []
+    assert response.status_code == 503
+    assert "provider_secret_unavailable" in response.text
+    assert PROVIDER_KEY not in response.text
+
+
+def test_cli_stores_lists_and_deletes_keys_without_printing_values(tmp_path, master_env, monkeypatch, capsys):
+    db = _fresh_db(tmp_path)
+    cfg = replace(_cfg_like(tmp_path, db), settings=replace(_cfg_like(tmp_path, db).settings, database_path=db.path))
+    code, output = _cli(monkeypatch, cfg, ["provider-secret", "set", "OPENAI_API_KEY"],
+                        stdin_text=PROVIDER_KEY + "\n", capsys=capsys)
+    assert code == 0 and "stored name=OPENAI_API_KEY key_version=1" in output.out
+    assert PROVIDER_KEY not in output.out + output.err
+    code, output = _cli(monkeypatch, cfg, ["provider-secret", "list"], capsys=capsys)
+    assert code == 0 and "name=OPENAI_API_KEY key_version=1" in output.out
+    assert PROVIDER_KEY not in output.out
+    code, output = _cli(monkeypatch, cfg, ["provider-secret", "delete", "OPENAI_API_KEY"], capsys=capsys)
+    assert code == 0 and "deleted" in output.out
+    assert any(row["action"] == "provider_secret.store" for row in audit_rows(db))
+    assert PROVIDER_KEY.encode() not in db_bytes(db)
+
+
+def test_cli_rejects_oversized_key_and_missing_master_key(tmp_path, master_env, monkeypatch, capsys):
+    db = _fresh_db(tmp_path)
+    cfg = replace(_cfg_like(tmp_path, db), settings=replace(_cfg_like(tmp_path, db).settings, database_path=db.path))
+    code, output = _cli(monkeypatch, cfg, ["provider-secret", "set", "OPENAI_API_KEY"],
+                        stdin_text="x" * 9000 + "\n", capsys=capsys)
+    assert code == 2 and "too large" in output.out
+    assert provider_secret_names(db) == frozenset()
+    master_env.delenv("GATEWAY_MASTER_KEY")
+    code, output = _cli(monkeypatch, cfg, ["provider-secret", "set", "OPENAI_API_KEY"],
+                        stdin_text=PROVIDER_KEY + "\n", capsys=capsys)
+    assert code == 2
+    assert PROVIDER_KEY not in output.out + output.err
+    assert provider_secret_names(db) == frozenset()
+
+
+def _cfg_like(tmp_path, db):
+    settings = GatewaySettings("127.0.0.1", 8000, db.path, 3.0, 1_048_576, 30)
+    return GatewayConfig(settings, {})
+
+
+# 18. SSRF: configuration checks, address classification, and connection-time pinning.
+@pytest.mark.parametrize(("address", "tier"), [
+    ("8.8.8.8", "public"),
+    ("2606:4700:4700::1111", "public"),
+    ("10.0.0.1", "internal"),
+    ("192.168.1.10", "internal"),
+    ("172.16.5.5", "internal"),
+    ("127.0.0.1", "internal"),
+    ("::1", "internal"),
+    ("::ffff:127.0.0.1", "internal"),
+    ("100.64.0.1", "internal"),
+    ("fc00::1", "internal"),
+    ("64:ff9b::8.8.8.8", "public"),
+    ("64:ff9b::7f00:1", "internal"),
+    ("2002:7f00:1::1", "internal"),
+    ("2002:a9fe:a9fe::1", "denied"),
+    ("169.254.169.254", "denied"),
+    ("169.254.170.2", "denied"),
+    ("100.100.100.200", "denied"),
+    ("fd00:ec2::254", "denied"),
+    ("0.0.0.0", "denied"),
+    ("224.0.0.1", "denied"),
+    ("240.0.0.1", "denied"),
+    ("255.255.255.255", "denied"),
+    ("fe80::1", "denied"),
+    ("::", "denied"),
+    ("::127.0.0.1", "denied"),
+])
+def test_address_classification_blocks_metadata_and_internal_ranges(address, tier):
+    assert classify_address(address) == tier
+
+
+@pytest.mark.parametrize("api_base", [
+    "http://provider.example/v1",
+    "https://provider.example:8443/v1",
+    "https://169.254.169.254/latest",
+    "https://[fd00:ec2::254]/v1",
+    "https://127.0.0.1/v1",
+    "https://localhost/v1",
+    "https://user:secret@provider.example/v1",
+    "https://provider.example/v1?key=1",
+    "ftp://provider.example/v1",
+    "https://provider.example:notaport/v1",
+])
+def test_unsafe_provider_endpoints_are_rejected_at_config_time(api_base):
+    with pytest.raises(ValueError):
+        ProviderConfig("unsafe", "m", api_base, "OPENAI_API_KEY")
+
+
+def test_explicit_internal_provider_is_the_only_way_to_reach_internal_addresses():
+    trusted = (ipaddress.ip_network("127.0.0.1/32"),)
+    assert validate_provider_endpoint("http://127.0.0.1:8080/v1", trusted) == "http://127.0.0.1:8080/v1"
+    with pytest.raises(ValueError):
+        ProviderConfig("internal", "m", "http://127.0.0.1:8080/v1", "OPENAI_API_KEY")
+    with pytest.raises(ValueError):
+        ProviderConfig("bad-trust", "m", "https://provider.example/v1", "OPENAI_API_KEY",
+                       trusted_internal_networks=(ipaddress.ip_network("169.254.0.0/16"),))
+
+
+def _resolve_with(table):
+    calls = []
+
+    async def resolver(host: str, port: int) -> list[str]:
+        calls.append((host, port))
+        return list(table[host])
+
+    resolver.calls = calls
+    return resolver
+
+
+async def _post_through_transport(host: str, resolver, *, scheme: str = "https", port: int = 443,
+                                  trusted=()):
+    policy = EgressPolicy(tuple(trusted))
+    transport = PinnedDestinationTransport(policy, resolver)
+    async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False) as client:
+        return await client.post(f"{scheme}://{host}:{port}/v1/chat/completions", json={"model": "m"})
+
+
+@pytest.mark.parametrize("addresses", [
+    ["169.254.169.254"],
+    ["127.0.0.1"],
+    ["8.8.8.8", "10.0.0.5"],
+    ["8.8.8.8", "fe80::1"],
+    ["not-an-ip"],
+])
+def test_any_forbidden_address_blocks_the_whole_connection(addresses):
+    resolver = _resolve_with({"provider.example": addresses})
+    with pytest.raises(DestinationBlockedError):
+        asyncio.run(_post_through_transport("provider.example", resolver))
+    assert resolver.calls == [("provider.example", 443)]
+
+
+def test_dns_failure_is_reported_as_connection_failure_not_as_allowed():
+    async def failing(host: str, port: int) -> list[str]:
+        raise OSError("name resolution failed")
+
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(_post_through_transport("provider.example", failing))
+
+
+def test_plain_http_and_nonstandard_ports_are_blocked_for_public_providers():
+    resolver = _resolve_with({"provider.example": ["8.8.8.8"]})
+    with pytest.raises(DestinationBlockedError):
+        asyncio.run(_post_through_transport("provider.example", resolver, scheme="http", port=80))
+    with pytest.raises(DestinationBlockedError):
+        asyncio.run(_post_through_transport("provider.example", resolver, port=8443))
+    assert resolver.calls == []
+
+
+class _ProviderHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802 - http.server naming
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.server.seen.append({"host": self.headers.get("Host"), "auth": self.headers.get("Authorization"),
+                                 "path": self.path})
+        if self.path.endswith("/redirect"):
+            self.send_response(302)
+            self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+            self.end_headers()
+            return
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
+        data = json.dumps({"id": "local", "object": "chat.completion", "created": 1, "model": body.get("model"),
+                           "choices": [{"index": 0, "message": {"role": "assistant", "content": "local answer"},
+                                        "finish_reason": "stop"}],
+                           "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args) -> None:  # keep test output quiet
+        return
+
+
+@pytest.fixture
+def provider_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderHandler)
+    server.seen = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_pinned_connection_uses_only_the_validated_address_and_original_host(provider_server):
+    port = provider_server.server_address[1]
+    resolver = _resolve_with({"provider.internal.test": ["127.0.0.1"]})
+    trusted = (ipaddress.ip_network("127.0.0.0/8"),)
+    response = asyncio.run(_post_through_transport("provider.internal.test", resolver, scheme="http",
+                                                   port=port, trusted=trusted))
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "local answer"
+    assert resolver.calls == [("provider.internal.test", port)]
+    assert provider_server.seen[0]["host"] == f"provider.internal.test:{port}"
+
+
+def test_each_connection_is_validated_and_a_rebound_answer_is_never_used(provider_server):
+    port = provider_server.server_address[1]
+    answers = iter([["127.0.0.1"], ["169.254.169.254"]])
+
+    async def rebinding(host: str, port_: int) -> list[str]:
+        return next(answers)
+
+    trusted = (ipaddress.ip_network("127.0.0.0/8"),)
+    first = asyncio.run(_post_through_transport("rebind.internal.test", rebinding, scheme="http", port=port, trusted=trusted))
+    assert first.status_code == 200
+    with pytest.raises(DestinationBlockedError):
+        asyncio.run(_post_through_transport("rebind.internal.test", rebinding, scheme="http", port=port, trusted=trusted))
+    assert len(provider_server.seen) == 1
+
+
+def test_redirects_from_providers_are_returned_not_followed(provider_server):
+    port = provider_server.server_address[1]
+    resolver = _resolve_with({"redirect.internal.test": ["127.0.0.1"]})
+    trusted = (ipaddress.ip_network("127.0.0.0/8"),)
+
+    async def call() -> httpx.Response:
+        transport = PinnedDestinationTransport(EgressPolicy(trusted), resolver)
+        async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False) as client:
+            return await client.post(f"http://redirect.internal.test:{port}/v1/redirect", json={"model": "m"})
+
+    response = asyncio.run(call())
+    assert response.status_code == 302
+    assert len(provider_server.seen) == 1
+
+
+def _route_app(tmp_path, providers, resolver, db=None):
+    settings = GatewaySettings("127.0.0.1", 8000, str(tmp_path / "routing.sqlite3"), 5.0, 1_048_576, 30)
+    cfg = GatewayConfig(settings, {"fast": ModelConfig("fast", True, tuple(providers))})
+    database = db or Database(settings.database_path)
+    app = create_app(cfg, database)
+    app.state.dns_resolver = resolver
+    return app, database
+
+
+def _static_resolver(table):
+    async def resolver(host: str, port: int) -> list[str]:
+        return list(table[host])
+
+    return resolver
+
+
+def test_blocked_provider_falls_back_to_explicit_internal_provider(tmp_path, monkeypatch, provider_server):
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    monkeypatch.setenv("ROUTE_PRIMARY_API_KEY", "synthetic-primary-route-key")
+    monkeypatch.setenv("ROUTE_SECONDARY_API_KEY", "synthetic-secondary-route-key")
+    port = provider_server.server_address[1]
+    providers = [
+        ProviderConfig("primary", "m1", "https://primary.example/v1", "ROUTE_PRIMARY_API_KEY", True),
+        ProviderConfig("secondary", "m2", f"http://secondary.internal:{port}/v1", "ROUTE_SECONDARY_API_KEY", True,
+                       trusted_internal_networks=(ipaddress.ip_network("127.0.0.0/8"),)),
+    ]
+    resolver = _static_resolver({"primary.example": ["169.254.169.254"], "secondary.internal": ["127.0.0.1"]})
+    app, db = _route_app(tmp_path, providers, resolver)
+    token = create_client_key(db, PEPPER, "fallback-ssrf", 20)[1]
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                               json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "local answer"
+    assert db.usage_for_client(db.list_clients()[0]["client_id"])[0]["provider_name"] == "secondary"
+    assert provider_server.seen[0]["auth"] == "Bearer synthetic-secondary-route-key"
+
+
+def test_only_blocked_providers_return_destination_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    monkeypatch.setenv("ROUTE_PRIMARY_API_KEY", "synthetic-primary-route-key")
+    providers = [ProviderConfig("primary", "m1", "https://primary.example/v1", "ROUTE_PRIMARY_API_KEY", True)]
+    app, db = _route_app(tmp_path, providers, _static_resolver({"primary.example": ["127.0.0.1"]}))
+    token = create_client_key(db, PEPPER, "blocked-only", 20)[1]
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                               json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "provider_destination_blocked"
+
+
+def test_streaming_and_non_streaming_v1_work_through_the_pinned_transport(tmp_path, monkeypatch, provider_server):
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    monkeypatch.setenv("ROUTE_SECONDARY_API_KEY", "synthetic-secondary-route-key")
+    port = provider_server.server_address[1]
+    providers = [ProviderConfig("secondary", "m2", f"http://secondary.internal:{port}/v1", "ROUTE_SECONDARY_API_KEY", True,
+                                trusted_internal_networks=(ipaddress.ip_network("127.0.0.0/8"),))]
+    app, db = _route_app(tmp_path, providers, _static_resolver({"secondary.internal": ["127.0.0.1"]}))
+    token = create_client_key(db, PEPPER, "sse-pinned", 60)[1]
+    with TestClient(app) as client:
+        plain = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]})
+        streamed = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+                               json={"model": "fast", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    assert plain.status_code == 200 and plain.json()["model"] == "fast"
+    assert streamed.status_code == 200
+    assert streamed.headers["content-type"].startswith("text/event-stream")
+    assert "data: [DONE]" in streamed.text

@@ -14,8 +14,15 @@ from .auth import (
     set_admin_user_active,
 )
 from .config import load_config
+from .crypto import CryptoError, Keyring, load_keyring
 from .database import Database
-from .secret_loader import SecretLoadError, resolve_secret
+from .provider_secrets import (
+    delete_provider_secret,
+    list_provider_secrets,
+    rotate_provider_secrets,
+    store_provider_secret,
+)
+from .secret_loader import MAX_SECRET_BYTES, SecretLoadError, resolve_secret
 
 IP_RULES_CLEAR_PHRASE = "DELETE-ALL-ADMIN-IP-RULES"
 _CLI_AGENT = "local-cli"
@@ -60,7 +67,34 @@ def _build_parser() -> argparse.ArgumentParser:
     ip_sub.add_parser("reopen", help="Deactivate every allow rule, which lifts the allowlist and keeps deny rules.")
     clear = ip_sub.add_parser("clear", help="Delete every admin IP rule. Requires explicit confirmation.")
     clear.add_argument("--confirm", default=None, help=f"Must equal {IP_RULES_CLEAR_PHRASE}")
+
+    secret = sub.add_parser("provider-secret", help="Manage encrypted provider API keys.")
+    secret_sub = secret.add_subparsers(dest="secret_command", required=True)
+    secret_set = secret_sub.add_parser("set", help="Store a key read from a terminal prompt or stdin.")
+    secret_set.add_argument("name", help="Provider key name, for example OPENAI_API_KEY")
+    secret_sub.add_parser("list", help="List key names and versions. Values are never shown.")
+    secret_delete = secret_sub.add_parser("delete")
+    secret_delete.add_argument("name")
+    secret_sub.add_parser("rotate", help="Re-encrypt every stored key with the current master key version.")
     return parser
+
+
+def _read_provider_value() -> str:
+    if sys.stdin.isatty():
+        value = getpass.getpass("Provider API key: ")
+    else:
+        # Read one bounded value; a key larger than the secret limit is refused without storing anything.
+        data = sys.stdin.read(MAX_SECRET_BYTES + 3)
+        if len(data) > MAX_SECRET_BYTES + 2:
+            raise ValueError("provider key is too large")
+        if data.endswith("\r\n"):
+            data = data[:-2]
+        elif data.endswith("\n"):
+            data = data[:-1]
+        value = data
+    if not value:
+        raise ValueError("no provider key was provided")
+    return value
 
 
 def _read_password(from_stdin: bool) -> str:
@@ -142,18 +176,56 @@ def _clear(db: Database, confirm: str | None) -> int:
     return 0
 
 
+def _provider_secret_command(db: Database, args: argparse.Namespace, keyring: Keyring | None) -> int:
+    try:
+        if args.secret_command == "set":
+            assert keyring is not None
+            version = store_provider_secret(db, keyring, args.name, _read_provider_value())
+            print(f"stored name={args.name} key_version={version}")
+            return 0
+        if args.secret_command == "list":
+            for info in list_provider_secrets(db):
+                print(f"name={info.provider_name} key_version={info.key_version} updated_at={info.updated_at}")
+            return 0
+        if args.secret_command == "delete":
+            if delete_provider_secret(db, args.name):
+                print("deleted")
+                return 0
+            print("not_found")
+            return 1
+        if args.secret_command == "rotate":
+            assert keyring is not None
+            print(f"rotated={rotate_provider_secrets(db, keyring)}")
+            return 0
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
+    except CryptoError as exc:
+        print(f"error: {exc}")
+        return 1
+    return 2
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
     config = load_config()
     pepper: str | None = None
+    keyring: Keyring | None = None
     if args.command == "create-key":
         try:
             pepper = resolve_secret("GATEWAY_PEPPER")
         except SecretLoadError:
             parser.exit(2, "error: required secret is unavailable.\n")
+    if args.command == "provider-secret" and args.secret_command in {"set", "rotate"}:
+        try:
+            keyring = load_keyring()
+        except CryptoError as exc:
+            parser.exit(2, f"error: {exc}\n")
     db = Database(config.settings.database_path)
     db.init()
+    if args.command == "provider-secret":
+        return _provider_secret_command(db, args, keyring)
     if args.command == "create-key":
         assert pepper is not None
         client_id, raw_key = create_client_key(db, pepper, args.name, args.rpm)

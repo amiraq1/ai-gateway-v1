@@ -16,8 +16,16 @@ from .auth import authenticate_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
-from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, _headers, complete
+from .provider_secrets import provider_secret_names, resolve_provider_api_key
+from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, SecretSource, _client, _headers, complete
 from .secret_loader import SecretLoadError, resolve_secret
+from .ssrf import DestinationBlockedError, Resolver, system_resolver
+
+
+def _secret_source(database: Database) -> SecretSource:
+    def resolve(name: str) -> str:
+        return resolve_provider_api_key(database, name)
+    return resolve
 
 
 class BoundedBodyMiddleware:
@@ -88,6 +96,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app.state.gateway_config = cfg
     app.state.database = database
     app.state.http_transport = None
+    app.state.dns_resolver = system_resolver
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
     app.add_exception_handler(AdminApiError, admin_error_handler)
     app.include_router(admin_router)
@@ -122,7 +131,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         if isinstance(client, JSONResponse):
             return client
         created = int(time.time())
-        return {"object": "list", "data": [{"id": alias, "object": "model", "created": created, "owned_by": "ai-gateway"} for alias in cfg.public_aliases()]}
+        return {"object": "list", "data": [{"id": alias, "object": "model", "created": created, "owned_by": "ai-gateway"} for alias in cfg.public_aliases(provider_secret_names(database))]}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(payload: ChatCompletionRequest, request: Request, client: dict[str, Any] | JSONResponse = Depends(get_client)) -> Any:
@@ -131,7 +140,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         allowed, retry_after = database.consume_rate_limit(client["client_id"], int(client["rpm"]))
         if not allowed:
             return _error(429, "Rate limit exceeded.", "rate_limit_error", "rate_limit_exceeded", {"Retry-After": str(retry_after)})
-        providers = cfg.providers_for(payload.model)
+        providers = cfg.providers_for(payload.model, provider_secret_names(database))
         if not providers:
             return _error(404, "The requested model is not available.", "invalid_request_error", "model_not_found")
         try:
@@ -139,14 +148,16 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         except ValueError as exc:
             return _error(400, str(exc), "invalid_request_error", "unsupported_parameter")
         started = time.monotonic()
+        secret_source = _secret_source(database)
+        resolver: Resolver = request.app.state.dns_resolver
         if payload.stream:
             return StreamingResponse(
-                _stream_chat(database, cfg, client, payload.model, providers, upstream_payload, request.app.state.http_transport, started),
+                _stream_chat(database, cfg, client, payload.model, providers, upstream_payload, request.app.state.http_transport, started, secret_source, resolver),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
         try:
-            data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport)
+            data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport, secret_source=secret_source, resolver=resolver)
             data["model"] = payload.model
             database.log_request(make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
             return data
@@ -169,7 +180,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
 
 async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str, Any], alias: str,
                        providers: list[ProviderConfig], base_payload: dict[str, Any],
-                       transport: httpx.AsyncBaseTransport | None, started: float):
+                       transport: httpx.AsyncBaseTransport | None, started: float,
+                       secret_source: SecretSource = resolve_secret, resolver: Resolver = system_resolver):
     stream_deadline = started + min(600.0, cfg.settings.provider_timeout_seconds * 10)
     final_provider: str | None = None
     error_category: str | None = None
@@ -184,8 +196,8 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             event_size = 0
             saw_done = False
             try:
-                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=transport, follow_redirects=False) as http:
-                    async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider)) as response:
+                async with _client(provider, cfg.settings.provider_timeout_seconds, transport, resolver) as http:
+                    async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider, secret_source), json=_provider_body(base_payload, provider)) as response:
                         if response.status_code in RETRYABLE_STATUS:
                             await response.aread()
                             if index + 1 < len(attempt_providers):
@@ -247,6 +259,13 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                         final_provider = provider.name
                         success = True
                         break
+            except DestinationBlockedError:
+                if not emitted and index + 1 < len(attempt_providers):
+                    continue
+                error_category = "provider_destination_blocked"
+                final_status = 502
+                yield _safe_error_event(error_category)
+                return
             except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
                 if not emitted and index + 1 < len(attempt_providers):
                     continue

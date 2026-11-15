@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
 from .config import ProviderConfig
+from .crypto import CryptoError
 from .secret_loader import SecretLoadError, resolve_secret
+from .ssrf import DestinationBlockedError, EgressPolicy, PinnedDestinationTransport, Resolver, system_resolver
 
 RETRYABLE_STATUS = {429, *range(500, 600)}
 MAX_ATTEMPTS = 2
+SecretSource = Callable[[str], str]
 
 
 class ProviderFailure(Exception):
@@ -24,12 +28,21 @@ def _url(provider: ProviderConfig) -> str:
     return f"{provider.api_base.rstrip('/')}/chat/completions"
 
 
-def _headers(provider: ProviderConfig) -> dict[str, str]:
+def _headers(provider: ProviderConfig, secret_source: SecretSource = resolve_secret) -> dict[str, str]:
     try:
-        secret = resolve_secret(provider.api_key_env)
-    except SecretLoadError:
+        secret = secret_source(provider.api_key_env)
+    except (SecretLoadError, CryptoError):
         raise ProviderFailure("provider_secret_unavailable", 503, False) from None
     return {"Authorization": f"Bearer {secret}", "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+
+
+def _client(provider: ProviderConfig, timeout: float, transport: httpx.AsyncBaseTransport | None,
+            resolver: Resolver) -> httpx.AsyncClient:
+    """Injected transports (tests) are used as-is. Production connections go through the pinned destination transport."""
+    if transport is None:
+        transport = PinnedDestinationTransport(EgressPolicy(provider.trusted_internal_networks), resolver)
+    # trust_env=False keeps environment proxies from routing around the destination checks.
+    return httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False, trust_env=False)
 
 
 def _extract_usage(data: Any) -> dict[str, Any] | None:
@@ -39,14 +52,16 @@ def _extract_usage(data: Any) -> dict[str, Any] | None:
 
 
 async def complete(providers: list[ProviderConfig], payload: dict[str, Any], timeout: float,
-                   transport: httpx.AsyncBaseTransport | None = None) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+                   transport: httpx.AsyncBaseTransport | None = None, *,
+                   secret_source: SecretSource = resolve_secret,
+                   resolver: Resolver = system_resolver) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
     last: ProviderFailure | None = None
     for index, provider in enumerate(providers[:MAX_ATTEMPTS]):
         body = dict(payload)
         body["model"] = provider.model
         try:
-            async with httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False) as client:
-                response = await client.post(_url(provider), headers=_headers(provider), json=body)
+            async with _client(provider, timeout, transport, resolver) as client:
+                response = await client.post(_url(provider), headers=_headers(provider, secret_source), json=body)
             if response.status_code in RETRYABLE_STATUS:
                 last = ProviderFailure("provider_unavailable", 502, True)
                 if index + 1 < min(len(providers), MAX_ATTEMPTS):
@@ -65,6 +80,11 @@ async def complete(providers: list[ProviderConfig], payload: dict[str, Any], tim
             return data, provider.name, _extract_usage(data)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
             last = ProviderFailure("provider_connection", 504, True)
+            if index + 1 < min(len(providers), MAX_ATTEMPTS):
+                continue
+            raise last from None
+        except DestinationBlockedError:
+            last = ProviderFailure("provider_destination_blocked", 502, True)
             if index + 1 < min(len(providers), MAX_ATTEMPTS):
                 continue
             raise last from None

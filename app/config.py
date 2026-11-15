@@ -28,6 +28,11 @@ def _validate_provider_api_key_env(value: str) -> str:
     return value
 
 
+def validate_provider_api_key_env(value: str) -> str:
+    """Public name check used by the encrypted key store and the CLI."""
+    return _validate_provider_api_key_env(value)
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     name: str
