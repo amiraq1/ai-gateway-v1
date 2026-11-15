@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from app import admin
 from app.audit import record_audit_event
 from app.auth import (
+    Argon2Gate,
     LoginPolicy,
     authenticate_admin,
     bootstrap_first_admin,
@@ -544,14 +545,21 @@ def test_authenticate_admin_rate_limit_is_keyed_by_resolved_ip(tmp_path):
     db.init()
     bootstrap_first_admin(db, ADMIN_USER, ADMIN_PASSWORD)
     policy = LoginPolicy(max_failures=1, window_seconds=900)
-    first = authenticate_admin(db, username=ADMIN_USER, password="wrong-synthetic-password-value", ip_key="198.51.100.20",
-                               ip_address="198.51.100.20", user_agent=None, policy=policy, session_ttl_seconds=3600, now=5000)
+    gate = Argon2Gate(2, 8)
+
+    async def attempt(password: str, ip: str, now: int):
+        return await authenticate_admin(db, gate, username=ADMIN_USER, password=password, ip_key=ip,
+                                        ip_address=ip, user_agent=None, policy=policy,
+                                        session_ttl_seconds=3600, now=now)
+
+    async def scenario():
+        return (await attempt("wrong-synthetic-password-value", "198.51.100.20", 5000),
+                await attempt(ADMIN_PASSWORD, "198.51.100.20", 5001),
+                await attempt(ADMIN_PASSWORD, "203.0.113.9", 5001))
+
+    first, second, other = asyncio.run(scenario())
     assert first.outcome == "invalid_credentials"
-    second = authenticate_admin(db, username=ADMIN_USER, password=ADMIN_PASSWORD, ip_key="198.51.100.20",
-                                ip_address="198.51.100.20", user_agent=None, policy=policy, session_ttl_seconds=3600, now=5001)
     assert second.outcome == "rate_limited"
-    other = authenticate_admin(db, username=ADMIN_USER, password=ADMIN_PASSWORD, ip_key="203.0.113.9",
-                               ip_address="203.0.113.9", user_agent=None, policy=policy, session_ttl_seconds=3600, now=5001)
     assert other.outcome == "success"
 
 

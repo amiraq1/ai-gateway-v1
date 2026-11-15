@@ -70,6 +70,9 @@ class GatewaySettings:
     admin_login_max_failures: int = 5
     admin_login_window_seconds: int = 900
     admin_allowed_origins: tuple[str, ...] = ()
+    # Argon2 work allowed at once per worker process, and how many more may wait.
+    admin_password_hash_concurrency: int = 2
+    admin_password_hash_queue: int = 8
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,10 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
         admin_login_max_failures=_int_setting("ADMIN_LOGIN_MAX_FAILURES", raw_settings.get("admin_login_max_failures", 5), 1, 100),
         admin_login_window_seconds=_int_setting("ADMIN_LOGIN_WINDOW_SECONDS", raw_settings.get("admin_login_window_seconds", 900), 60, 86400),
         admin_allowed_origins=allowed_origins,
+        admin_password_hash_concurrency=_int_setting("ADMIN_PASSWORD_HASH_CONCURRENCY",
+                                                     raw_settings.get("admin_password_hash_concurrency", 2), 1, 8),
+        admin_password_hash_queue=_int_setting("ADMIN_PASSWORD_HASH_QUEUE",
+                                               raw_settings.get("admin_password_hash_queue", 8), 0, 64),
     )
 
     raw_models = raw.get("models", {})

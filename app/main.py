@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .admin_routes import AdminApiError, admin_error_handler
 from .admin_routes import router as admin_router
-from .auth import authenticate_key, make_request_log
+from .auth import Argon2Gate, authenticate_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
@@ -97,6 +97,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app.state.database = database
     app.state.http_transport = None
     app.state.dns_resolver = system_resolver
+    app.state.argon2_gate = Argon2Gate(cfg.settings.admin_password_hash_concurrency,
+                                       cfg.settings.admin_password_hash_queue)
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
     app.add_exception_handler(AdminApiError, admin_error_handler)
     app.include_router(admin_router)

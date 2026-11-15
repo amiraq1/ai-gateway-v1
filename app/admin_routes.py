@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import record_audit_event
-from .auth import LoginPolicy, authenticate_admin
+from .auth import Argon2Busy, LoginPolicy, authenticate_admin
 from .clock import now_epoch
 from .config import GatewayConfig
 from .database import Database
@@ -153,22 +153,28 @@ class IpRuleCreate(BaseModel):
 
 
 @router.post("/login")
-def admin_login(body: LoginBody, request: Request) -> JSONResponse:
+async def admin_login(body: LoginBody, request: Request) -> JSONResponse:
     _check_origin(request)
     settings = _settings(request)
     address = getattr(request.state, "client_address", None)
     ip_text = str(address) if address else None
     user_agent = request.headers.get("user-agent")
-    result = authenticate_admin(
-        _database(request),
-        username=body.username,
-        password=body.password,
-        ip_key=ip_text or "unknown",
-        ip_address=ip_text,
-        user_agent=user_agent,
-        policy=LoginPolicy(settings.admin_login_max_failures, settings.admin_login_window_seconds),
-        session_ttl_seconds=settings.admin_session_ttl_seconds,
-    )
+    try:
+        result = await authenticate_admin(
+            _database(request),
+            request.app.state.argon2_gate,
+            username=body.username,
+            password=body.password,
+            ip_key=ip_text or "unknown",
+            ip_address=ip_text,
+            user_agent=user_agent,
+            policy=LoginPolicy(settings.admin_login_max_failures, settings.admin_login_window_seconds),
+            session_ttl_seconds=settings.admin_session_ttl_seconds,
+        )
+    except Argon2Busy:
+        # Refused before any password was checked, so no failed attempt is recorded.
+        raise AdminApiError(503, "login_busy", "Login capacity is temporarily full. Try again shortly.",
+                            error_type="gateway_error", headers={"Retry-After": "2"}) from None
     if result.outcome == "rate_limited":
         raise AdminApiError(429, "login_rate_limited", "Too many failed login attempts. Try again later.",
                             error_type="rate_limit_error", headers={"Retry-After": str(result.retry_after)})

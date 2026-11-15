@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import re
 import secrets
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from functools import partial
+from typing import Any, TypeVar
 
+from anyio import to_thread
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
@@ -15,6 +21,8 @@ from .audit import record_audit_event
 from .clock import now_epoch
 from .database import Database
 from .sessions import IssuedSession, create_session, revoke_user_sessions
+
+T = TypeVar("T")
 
 
 def digest_key(raw_key: str, pepper: str) -> str:
@@ -81,10 +89,15 @@ ADMIN_PASSWORD_MAX_LENGTH = 1024
 _USERNAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
 _PASSWORD_HASHER = PasswordHasher()  # Argon2id with the argon2-cffi default cost parameters
 _dummy_hash_cache: str | None = None
+_dummy_hash_lock = threading.Lock()
 
 
 class AdminBootstrapError(Exception):
     """Bootstrap was refused, for example because an administrator already exists."""
+
+
+class Argon2Busy(Exception):
+    """This worker already has its maximum number of password checks queued."""
 
 
 def normalize_admin_username(value: str) -> str:
@@ -121,9 +134,64 @@ def verify_admin_password(stored_hash: str, candidate: str) -> bool:
 def _dummy_hash() -> str:
     """A valid hash that never matches, so unknown users cost the same as known ones."""
     global _dummy_hash_cache
-    if _dummy_hash_cache is None:
-        _dummy_hash_cache = _PASSWORD_HASHER.hash(secrets.token_urlsafe(24))
-    return _dummy_hash_cache
+    with _dummy_hash_lock:
+        if _dummy_hash_cache is None:
+            _dummy_hash_cache = _PASSWORD_HASHER.hash(secrets.token_urlsafe(24))
+        return _dummy_hash_cache
+
+
+def _verify_login_secret(stored_hash: str | None, candidate: str) -> tuple[bool, bool]:
+    """Check one password. Runs in a gate worker thread and returns (matches, needs_rehash)."""
+    if stored_hash is None:
+        verify_admin_password(_dummy_hash(), candidate)
+        return False, False
+    if not verify_admin_password(stored_hash, candidate):
+        return False, False
+    return True, _PASSWORD_HASHER.check_needs_rehash(stored_hash)
+
+
+class Argon2Gate:
+    """Runs Argon2 work on a bounded thread pool, never on the event loop.
+
+    At most `concurrency` hashes run at once in this process. Up to `queue` more
+    may wait. Work beyond that is refused at once with Argon2Busy, so login
+    pressure cannot create unbounded threads or memory use. The limit is per
+    worker process: a server with N workers allows about N * concurrency at once.
+    """
+
+    def __init__(self, concurrency: int = 2, queue: int = 8) -> None:
+        if concurrency < 1 or queue < 0:
+            raise ValueError("Argon2 concurrency must be at least 1 and queue at least 0")
+        self._executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="argon2")
+        self._capacity = concurrency + queue
+        self._pending = 0
+        self._lock = threading.Lock()
+
+    @property
+    def saturated(self) -> bool:
+        with self._lock:
+            return self._pending >= self._capacity
+
+    def _admit(self) -> None:
+        with self._lock:
+            if self._pending >= self._capacity:
+                raise Argon2Busy()
+            self._pending += 1
+
+    def _finished(self, _future: object) -> None:
+        with self._lock:
+            self._pending -= 1
+
+    async def run(self, func: Callable[..., T], *args: Any) -> T:
+        """Admit one job and wait for its result. A cancelled waiter still lets the job finish, and its slot is freed then."""
+        self._admit()
+        try:
+            future = self._executor.submit(func, *args)
+        except BaseException:
+            self._finished(None)
+            raise
+        future.add_done_callback(self._finished)
+        return await asyncio.wrap_future(future)
 
 
 def bootstrap_first_admin(db: Database, username: str, password: str, now: int | None = None) -> int:
@@ -200,7 +268,8 @@ def reserve_login_attempt(db: Database, ip_key: str, policy: LoginPolicy, now: i
 
     The reservation is written before the password is checked, so concurrent
     requests from one IP cannot all pass the check at once. A successful login
-    deletes its reservation; a failed login keeps it.
+    deletes its reservation; a failed login keeps it. A login refused for capacity
+    releases it, because no password was checked.
     Returns (attempt_id, 0) when allowed, or (None, retry_after_seconds) when blocked.
     """
     window_start = now - policy.window_seconds
@@ -215,6 +284,11 @@ def reserve_login_attempt(db: Database, ip_key: str, policy: LoginPolicy, now: i
             return None, retry_after
         cursor = conn.execute("INSERT INTO login_attempts(ip_key, attempted_at) VALUES (?, ?)", (ip_key, now))
         return int(cursor.lastrowid or 0), 0
+
+
+def release_login_attempt(db: Database, attempt_id: int) -> None:
+    with db.connect() as conn:
+        conn.execute("DELETE FROM login_attempts WHERE id = ?", (attempt_id,))
 
 
 def _audit_login(db: Database, action: str, *, admin_user_id: int | None, ip_address: str | None,
@@ -237,8 +311,29 @@ def _find_admin_user(db: Database, username: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def authenticate_admin(
+def _complete_login(db: Database, attempt_id: int, admin_id: int, upgraded_hash: str | None,
+                    ttl_seconds: int, ip_address: str | None, user_agent: str | None, now: int) -> IssuedSession:
+    with db.transaction() as conn:
+        conn.execute("DELETE FROM login_attempts WHERE id = ?", (attempt_id,))
+        conn.execute("UPDATE admin_users SET last_login_at = ? WHERE id = ?", (now, admin_id))
+        if upgraded_hash is not None:
+            conn.execute("UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                         (upgraded_hash, now, admin_id))
+        issued = create_session(conn, admin_user_id=admin_id, ttl_seconds=ttl_seconds,
+                                ip_address=ip_address, user_agent=user_agent, now=now)
+        record_audit_event(conn, action="admin.login.success", admin_user_id=admin_id,
+                           target=f"admin_user:{admin_id}", ip_address=ip_address,
+                           user_agent=user_agent, now=now)
+    return issued
+
+
+async def _audit_login_async(db: Database, action: str, **kwargs: Any) -> None:
+    await to_thread.run_sync(partial(_audit_login, db, action, **kwargs))
+
+
+async def authenticate_admin(
     db: Database,
+    gate: Argon2Gate,
     *,
     username: str,
     password: str,
@@ -251,48 +346,41 @@ def authenticate_admin(
 ) -> LoginResult:
     """Check credentials, enforce the per-IP login limit, and create a session on success.
 
-    Failures return the same outcome whether the user is unknown, disabled, or has a wrong password.
-    The reason is written only to the audit log. Passwords are never logged.
+    SQLite work runs in worker threads, and every Argon2 operation runs through
+    `gate`. Failures return the same outcome whether the user is unknown, disabled,
+    or has a wrong password. The reason is written only to the audit log.
+    Argon2Busy propagates when the gate is full; the reservation is released first.
     """
     current = now_epoch() if now is None else now
-    attempt_id, retry_after = reserve_login_attempt(db, ip_key, policy, current)
+    attempt_id, retry_after = await to_thread.run_sync(reserve_login_attempt, db, ip_key, policy, current)
     if attempt_id is None:
-        _audit_login(db, "admin.login.rate_limited", admin_user_id=None, ip_address=ip_address,
-                     user_agent=user_agent, reason="rate_limited", now=current)
+        await _audit_login_async(db, "admin.login.rate_limited", admin_user_id=None, ip_address=ip_address,
+                                 user_agent=user_agent, reason="rate_limited", now=current)
         return LoginResult("rate_limited", retry_after=retry_after)
 
-    user = _find_admin_user(db, username)
-    if user is None:
-        verify_admin_password(_dummy_hash(), password)
-        _audit_login(db, "admin.login.failure", admin_user_id=None, ip_address=ip_address,
-                     user_agent=user_agent, reason="unknown_user", now=current)
-        return LoginResult("invalid_credentials")
+    try:
+        user = await to_thread.run_sync(_find_admin_user, db, username)
+        stored = str(user["password_hash"]) if user is not None else None
+        password_ok, needs_rehash = await gate.run(_verify_login_secret, stored, password)
+        upgraded_hash = await gate.run(hash_admin_password, password) if (password_ok and needs_rehash) else None
+    except Argon2Busy:
+        await to_thread.run_sync(release_login_attempt, db, attempt_id)
+        raise
 
+    if user is None:
+        await _audit_login_async(db, "admin.login.failure", admin_user_id=None, ip_address=ip_address,
+                                 user_agent=user_agent, reason="unknown_user", now=current)
+        return LoginResult("invalid_credentials")
     admin_id = int(user["id"])
-    password_ok = verify_admin_password(user["password_hash"], password)
     if not user["is_active"]:
-        _audit_login(db, "admin.login.failure", admin_user_id=admin_id, ip_address=ip_address,
-                     user_agent=user_agent, reason="account_disabled", now=current)
+        await _audit_login_async(db, "admin.login.failure", admin_user_id=admin_id, ip_address=ip_address,
+                                 user_agent=user_agent, reason="account_disabled", now=current)
         return LoginResult("invalid_credentials")
     if not password_ok:
-        _audit_login(db, "admin.login.failure", admin_user_id=admin_id, ip_address=ip_address,
-                     user_agent=user_agent, reason="bad_password", now=current)
+        await _audit_login_async(db, "admin.login.failure", admin_user_id=admin_id, ip_address=ip_address,
+                                 user_agent=user_agent, reason="bad_password", now=current)
         return LoginResult("invalid_credentials")
 
-    # Upgrade the stored hash when library defaults change. Hashing runs outside the write transaction.
-    upgraded_hash: str | None = None
-    if _PASSWORD_HASHER.check_needs_rehash(user["password_hash"]):
-        upgraded_hash = hash_admin_password(password)
-
-    with db.transaction() as conn:
-        conn.execute("DELETE FROM login_attempts WHERE id = ?", (attempt_id,))
-        conn.execute("UPDATE admin_users SET last_login_at = ? WHERE id = ?", (current, admin_id))
-        if upgraded_hash is not None:
-            conn.execute("UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?",
-                         (upgraded_hash, current, admin_id))
-        issued = create_session(conn, admin_user_id=admin_id, ttl_seconds=session_ttl_seconds,
-                                ip_address=ip_address, user_agent=user_agent, now=current)
-        record_audit_event(conn, action="admin.login.success", admin_user_id=admin_id,
-                           target=f"admin_user:{admin_id}", ip_address=ip_address,
-                           user_agent=user_agent, now=current)
+    issued = await to_thread.run_sync(partial(_complete_login, db, attempt_id, admin_id, upgraded_hash,
+                                              session_ttl_seconds, ip_address, user_agent, current))
     return LoginResult("success", session=issued, username=str(user["username"]))
