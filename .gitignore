@@ -20,6 +20,9 @@ build/
 *.yaml
 *.yml
 !config/config.example.yaml
+!docker-compose.yml
+!compose.yaml
+!scripts/**
 
 # Credentials, key material, and certificates
 secrets/
