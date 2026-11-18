@@ -45,8 +45,8 @@ id_ed25519*
 .local-client-key
 
 # Logs, evidence, databases, backups, and runtime state
-evidence/*
-!evidence/final-report.md
+evidence/
+**/evidence/**
 logs/
 **/logs/**
 *.log
