@@ -70,3 +70,21 @@ def test_digest_requires_strong_pepper():
         assert "32 bytes" in str(exc)
     else:
         raise AssertionError("weak pepper was accepted")
+
+
+def test_authenticate_key_timing_equalization_and_forgery(tmp_path):
+    path = str(tmp_path / "timing.sqlite3")
+    db = Database(path)
+    db.init()
+    client_id, raw = create_client_key(db, PEPPER, "timing-client", 10)
+
+    # Forged key for existing client
+    forged_existing = f"gw_{client_id}.{'0' * 43}"
+    assert authenticate_key(db, PEPPER, forged_existing) is None
+
+    # Forged key for non-existent client
+    forged_nonexistent = f"gw_{'f' * 16}.{'0' * 43}"
+    assert authenticate_key(db, PEPPER, forged_nonexistent) is None
+
+    # Valid key returns client
+    assert authenticate_key(db, PEPPER, raw)["client_id"] == client_id
