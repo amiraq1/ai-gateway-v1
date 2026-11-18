@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from .auth import create_client_key
@@ -17,10 +18,12 @@ def main() -> int:
     create.add_argument("--rpm", type=int, default=60)
     revoke = sub.add_parser("revoke-key")
     revoke.add_argument("client_id")
-    sub.add_parser("list-clients")
+    list_p = sub.add_parser("list-clients")
+    list_p.add_argument("--json", action="store_true", help="Output in JSON format")
     usage = sub.add_parser("usage")
     usage.add_argument("client_id")
     usage.add_argument("--limit", type=int, default=100)
+    usage.add_argument("--json", action="store_true", help="Output in JSON format")
     backup = sub.add_parser("backup")
     backup.add_argument("destination")
     args = parser.parse_args()
@@ -34,7 +37,8 @@ def main() -> int:
     db = Database(config.settings.database_path)
     db.init()
     if args.command == "create-key":
-        assert pepper is not None
+        if pepper is None:
+            parser.exit(2, "error: required secret is unavailable.\n")
         client_id, raw_key = create_client_key(db, pepper, args.name, args.rpm)
         print(f"client_id={client_id}")
         print(f"api_key={raw_key}")
@@ -42,11 +46,19 @@ def main() -> int:
     elif args.command == "revoke-key":
         print("revoked" if db.revoke_client(args.client_id) else "not_found_or_already_revoked")
     elif args.command == "list-clients":
-        for item in db.list_clients():
-            print(" ".join(f"{key}={value}" for key, value in item.items()))
+        clients = db.list_clients()
+        if getattr(args, "json", False):
+            print(json.dumps(clients, indent=2))
+        else:
+            for item in clients:
+                print(" ".join(f"{key}={value}" for key, value in item.items()))
     elif args.command == "usage":
-        for item in db.usage_for_client(args.client_id, args.limit):
-            print(" ".join(f"{key}={value}" for key, value in item.items()))
+        logs = db.usage_for_client(args.client_id, args.limit)
+        if getattr(args, "json", False):
+            print(json.dumps(logs, indent=2))
+        else:
+            for item in logs:
+                print(" ".join(f"{key}={value}" for key, value in item.items()))
     elif args.command == "backup":
         destination = Path(args.destination)
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
