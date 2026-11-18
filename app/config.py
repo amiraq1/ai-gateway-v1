@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from .secret_loader import secret_source_configured
+from .ssrf import validate_ssrf_url
 
 
 _PROVIDER_API_KEY_ENV = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_API_KEY\Z")
@@ -71,12 +72,7 @@ class GatewayConfig:
 
 
 def _validate_api_base(value: str, provider_name: str) -> str:
-    parts = urlsplit(value)
-    if parts.scheme not in {"https", "http"} or not parts.netloc:
-        raise ValueError(f"Provider {provider_name!r} api_base must be an absolute HTTP(S) URL")
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError(f"Provider {provider_name!r} api_base cannot contain credentials, query, or fragment")
-    return value.rstrip("/")
+    return validate_ssrf_url(value, provider_name)
 
 
 def load_config(path: str | Path | None = None) -> GatewayConfig:

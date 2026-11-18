@@ -16,6 +16,7 @@ from .database import Database
 from .models import ChatCompletionRequest, provider_payload
 from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, _headers, complete
 from .secret_loader import SecretLoadError, resolve_secret
+from .ssrf import create_safe_transport
 
 
 class BoundedBodyMiddleware:
@@ -85,7 +86,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.gateway_config = cfg
     app.state.database = database
-    app.state.http_transport = None
+    app.state.http_transport = create_safe_transport()
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
 
     @app.exception_handler(RequestValidationError)
