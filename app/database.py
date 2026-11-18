@@ -15,7 +15,10 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
-_SCHEMA = """
+SCHEMA_VERSION = 1
+
+MIGRATIONS: dict[int, str] = {
+    1: """
 CREATE TABLE IF NOT EXISTS clients (
     client_id TEXT PRIMARY KEY,
     key_digest TEXT NOT NULL,
@@ -47,6 +50,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
 CREATE INDEX IF NOT EXISTS idx_request_logs_timestamp ON request_logs(timestamp_utc);
 CREATE INDEX IF NOT EXISTS idx_request_logs_client ON request_logs(client_id, timestamp_utc);
 """
+}
 
 
 class Database:
@@ -65,13 +69,30 @@ class Database:
         conn.execute("PRAGMA synchronous=FULL")
         return conn
 
+    def get_version(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def migrate(self, conn: sqlite3.Connection) -> int:
+        current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        has_tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clients'").fetchone()[0] > 0
+        if current_version == 0 and has_tables:
+            current_version = 1
+            conn.execute("PRAGMA user_version = 1")
+
+        for target_version in range(current_version + 1, SCHEMA_VERSION + 1):
+            if target_version in MIGRATIONS:
+                conn.executescript(MIGRATIONS[target_version])
+                conn.execute(f"PRAGMA user_version = {target_version}")
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
     def init(self) -> None:
         if self.path != ":memory:":
             old = os.umask(0o077)
             try:
                 Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 with self.connect() as conn:
-                    conn.executescript(_SCHEMA)
+                    self.migrate(conn)
                 try:
                     os.chmod(self.path, 0o600)
                 except OSError:
@@ -80,7 +101,7 @@ class Database:
                 os.umask(old)
         else:
             with self.connect() as conn:
-                conn.executescript(_SCHEMA)
+                self.migrate(conn)
 
     def add_client(self, client_id: str, digest: str, name: str, rpm: int, now: int | None = None) -> None:
         if rpm < 1 or rpm > 1_000_000:
