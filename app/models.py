@@ -26,6 +26,7 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = Field(default=None, max_length=128)
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
+    stream_options: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def tokens_not_both(self) -> "ChatCompletionRequest":

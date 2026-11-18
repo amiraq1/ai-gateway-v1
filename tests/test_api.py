@@ -114,6 +114,25 @@ def test_unknown_parameters_are_explicitly_rejected(gateway):
     assert response.json()["error"]["code"] == "unsupported_parameter"
 
 
+def test_stream_options_parameter_is_supported_and_forwarded(gateway):
+    app, db = gateway
+    captured = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return success_handler(request)
+    app.state.http_transport = httpx.MockTransport(handler)
+    token = key(db)
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json={
+            "model": "fast",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream_options": {"include_usage": True},
+        })
+    assert response.status_code == 200
+    assert len(captured) == 1
+    assert captured[0]["stream_options"] == {"include_usage": True}
+
+
 def test_rate_limit_is_persisted_and_returns_retry_after(gateway):
     app, db = gateway
     app.state.http_transport = httpx.MockTransport(success_handler)
