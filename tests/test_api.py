@@ -155,3 +155,33 @@ def test_request_body_limit_returns_413(gateway):
         response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, content=b"x" * 2048)
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_provider_with_allow_private_hosts(tmp_path, monkeypatch):
+    from app.config import GatewayConfig, GatewaySettings, ModelConfig, ProviderConfig
+    from app.database import Database
+    from app.main import create_app
+
+    monkeypatch.setenv("GATEWAY_PEPPER", "test-pepper-that-is-at-least-32-bytes-long")
+    monkeypatch.setenv("TEST_LOCAL_API_KEY", "local-provider-secret")
+    settings = GatewaySettings("127.0.0.1", 8000, str(tmp_path / "gateway.sqlite3"), 3.0, 1_048_576, 30)
+    provider = ProviderConfig("ollama", "llama3", "http://127.0.0.1:11434/v1", "TEST_LOCAL_API_KEY", True, allow_private_hosts=True)
+    cfg = GatewayConfig(settings, {"local-llama": ModelConfig("local-llama", True, (provider,))})
+    db = Database(settings.database_path)
+    app = create_app(cfg, db)
+
+    upstream_requests = []
+    app.state.http_transport = httpx.MockTransport(
+        lambda req: (upstream_requests.append(req) or success_handler(req))
+    )
+
+    with TestClient(app) as client:
+        token = key(db)
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "local-llama", "messages": [{"role": "user", "content": "hello local"}]},
+        )
+        assert response.status_code == 200
+        assert len(upstream_requests) == 1
+        assert str(upstream_requests[0].url) == "http://127.0.0.1:11434/v1/chat/completions"

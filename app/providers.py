@@ -7,6 +7,7 @@ import httpx
 
 from .config import ProviderConfig
 from .secret_loader import SecretLoadError, resolve_secret
+from .ssrf import create_safe_transport
 
 RETRYABLE_STATUS = {429, *range(500, 600)}
 MAX_ATTEMPTS = 2
@@ -40,14 +41,19 @@ def _extract_usage(data: Any) -> dict[str, Any] | None:
 
 
 async def complete(providers: list[ProviderConfig], payload: dict[str, Any], timeout: float,
-                   transport: httpx.AsyncBaseTransport | None = None) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+                   transport: httpx.AsyncBaseTransport | dict[bool, httpx.AsyncBaseTransport] | None = None) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
     last: ProviderFailure | None = None
     for index, provider in enumerate(providers[:MAX_ATTEMPTS]):
         body = dict(payload)
         body["model"] = provider.model
+        provider_transport = transport
+        if isinstance(transport, dict):
+            provider_transport = transport.get(provider.allow_private_hosts)
+        elif transport is None:
+            provider_transport = create_safe_transport(allow_private_hosts=provider.allow_private_hosts)
         try:
             body_bytes = bytearray()
-            async with httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, transport=provider_transport, follow_redirects=False) as client:
                 async with client.stream("POST", _url(provider), headers=_headers(provider), json=body) as response:
                     if response.status_code in RETRYABLE_STATUS:
                         await response.aread()

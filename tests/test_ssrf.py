@@ -62,3 +62,32 @@ def test_safe_ssrf_network_backend_blocks_dns_rebinding_to_private():
     backend = SafeSSRFNetworkBackend(dns_resolver=lambda host, port: ["169.254.169.254"])
     with pytest.raises(httpcore.ConnectError, match="SSRF protection blocked target"):
         asyncio.run(backend.connect_tcp("evil-rebinding.example", 443))
+
+
+def test_allow_private_hosts_permits_local_targets():
+    assert validate_ssrf_url("http://127.0.0.1:11434/v1", "ollama", allow_private_hosts=True) == "http://127.0.0.1:11434/v1"
+    assert validate_ssrf_url("http://localhost:8080/v1", "llama-cpp", allow_private_hosts=True) == "http://localhost:8080/v1"
+    assert validate_ssrf_url("http://192.168.1.50:8000/v1", "lan-llm", allow_private_hosts=True) == "http://192.168.1.50:8000/v1"
+    assert validate_ssrf_url("http://10.0.1.25:8000/v1", "internal-vllm", allow_private_hosts=True) == "http://10.0.1.25:8000/v1"
+
+
+def test_allow_private_hosts_still_blocks_cloud_metadata_and_cgnat():
+    with pytest.raises(ValueError):
+        validate_ssrf_url("http://169.254.169.254/latest/meta-data/", "metadata", allow_private_hosts=True)
+    with pytest.raises(ValueError):
+        validate_ssrf_url("http://100.64.0.1/v1", "cgnat", allow_private_hosts=True)
+
+
+def test_is_ip_forbidden_with_allow_private_hosts():
+    assert is_ip_forbidden("127.0.0.1", allow_private_hosts=True) is False
+    assert is_ip_forbidden("192.168.1.1", allow_private_hosts=True) is False
+    assert is_ip_forbidden("10.0.0.1", allow_private_hosts=True) is False
+    assert is_ip_forbidden("169.254.169.254", allow_private_hosts=True) is True
+    assert is_ip_forbidden("100.64.1.1", allow_private_hosts=True) is True
+
+
+def test_backend_with_allow_private_hosts_still_blocks_metadata():
+    backend = SafeSSRFNetworkBackend(dns_resolver=lambda host, port: ["169.254.169.254"], allow_private_hosts=True)
+    with pytest.raises(httpcore.ConnectError, match="SSRF protection blocked target"):
+        asyncio.run(backend.connect_tcp("metadata.example", 80))
+

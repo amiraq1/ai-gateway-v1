@@ -34,6 +34,7 @@ class ProviderConfig:
     api_base: str
     api_key_env: str
     enabled: bool = True
+    allow_private_hosts: bool = False
 
     def __post_init__(self) -> None:
         _validate_provider_api_key_env(self.api_key_env)
@@ -71,8 +72,8 @@ class GatewayConfig:
         return sorted(alias for alias in self.models if self.providers_for(alias))
 
 
-def _validate_api_base(value: str, provider_name: str) -> str:
-    return validate_ssrf_url(value, provider_name)
+def _validate_api_base(value: str, provider_name: str, allow_private_hosts: bool = False) -> str:
+    return validate_ssrf_url(value, provider_name, allow_private_hosts=allow_private_hosts)
 
 
 def load_config(path: str | Path | None = None) -> GatewayConfig:
@@ -115,7 +116,8 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
             if not name or not model_id or not key_env:
                 raise ValueError(f"Provider for {alias!r} requires name, model, and api_key_env")
             _validate_provider_api_key_env(key_env)
-            api_base = _validate_api_base(str(item.get("api_base", "")), name)
-            providers.append(ProviderConfig(name, model_id, api_base, key_env, bool(item.get("enabled", True))))
+            allow_private = bool(item.get("allow_private_hosts", False))
+            api_base = _validate_api_base(str(item.get("api_base", "")), name, allow_private_hosts=allow_private)
+            providers.append(ProviderConfig(name, model_id, api_base, key_env, bool(item.get("enabled", True)), allow_private_hosts=allow_private))
         models[alias] = ModelConfig(alias, bool(entry.get("enabled", True)), tuple(providers))
     return GatewayConfig(settings, models)

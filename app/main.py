@@ -86,7 +86,11 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.gateway_config = cfg
     app.state.database = database
-    app.state.http_transport = create_safe_transport()
+    app.state.http_transports = {
+        False: create_safe_transport(allow_private_hosts=False),
+        True: create_safe_transport(allow_private_hosts=True),
+    }
+    app.state.http_transport = app.state.http_transports
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
 
     @app.exception_handler(RequestValidationError)
@@ -180,8 +184,13 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             event_lines: list[str] = []
             event_size = 0
             saw_done = False
+            provider_transport = transport
+            if isinstance(transport, dict):
+                provider_transport = transport.get(provider.allow_private_hosts)
+            elif transport is None:
+                provider_transport = create_safe_transport(allow_private_hosts=provider.allow_private_hosts)
             try:
-                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=transport, follow_redirects=False) as http:
+                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=provider_transport, follow_redirects=False) as http:
                     async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider)) as response:
                         if response.status_code in RETRYABLE_STATUS:
                             await response.aread()
