@@ -91,7 +91,7 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     timeout = float(os.environ.get("PROVIDER_TIMEOUT_SECONDS", raw_settings.get("provider_timeout_seconds", 45)))
     max_body = int(os.environ.get("MAX_BODY_BYTES", raw_settings.get("max_body_bytes", 1_048_576)))
     retention = int(os.environ.get("LOG_RETENTION_DAYS", raw_settings.get("retention_days", 30)))
-    if not 1 <= port <= 65535 or not 1 <= timeout <= 120 or not 1024 <= max_body <= 10_485_760 or not 1 <= retention <= 365:
+    if not 1 <= port <= 65535 or not 1 <= timeout <= 240 or not 1024 <= max_body <= 10_485_760 or not 1 <= retention <= 365:
         raise ValueError("Invalid gateway setting range")
     db_path = os.environ.get("GATEWAY_DATABASE_PATH", str(raw_settings.get("database_path", "/tmp/ai-gateway.sqlite3")))
     settings = GatewaySettings(host, port, db_path, timeout, max_body, retention)
