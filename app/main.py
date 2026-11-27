@@ -40,9 +40,10 @@ def _check_db_health(database: Database) -> None:
 
 class BoundedBodyMiddleware:
     """Buffer only a small, bounded request body before JSON parsing."""
-    def __init__(self, app: Any, maximum: int) -> None:
+    def __init__(self, app: Any, maximum: int, body_timeout: float = 15.0) -> None:
         self.app = app
         self.maximum = maximum
+        self.body_timeout = body_timeout
 
     async def __call__(self, scope: dict[str, Any], receive: Callable, send: Callable) -> None:
         if scope.get("type") != "http":
@@ -50,8 +51,25 @@ class BoundedBodyMiddleware:
             return
         body = bytearray()
         disconnected = False
+        deadline = time.monotonic() + self.body_timeout
         while True:
-            message = await receive()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                response = JSONResponse(
+                    status_code=408,
+                    content={"error": {"message": "Request body read timed out.", "type": "invalid_request_error", "code": "request_timeout"}},
+                )
+                await response(scope, receive, send)
+                return
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except asyncio.TimeoutError:
+                response = JSONResponse(
+                    status_code=408,
+                    content={"error": {"message": "Request body read timed out.", "type": "invalid_request_error", "code": "request_timeout"}},
+                )
+                await response(scope, receive, send)
+                return
             if message["type"] == "http.disconnect":
                 disconnected = True
                 break
@@ -120,7 +138,13 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     }
     app.state.http_transport = app.state.http_transports
     app.state.http_clients = SharedHttpClients(app.state.http_transports, cfg.settings.provider_timeout_seconds)
-    app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
+    app.state.global_semaphore = asyncio.Semaphore(cfg.settings.max_concurrent_requests)
+    app.state.client_semaphores = {}
+    app.add_middleware(
+        BoundedBodyMiddleware,
+        maximum=cfg.settings.max_body_bytes,
+        body_timeout=cfg.settings.body_read_timeout_seconds,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -167,10 +191,54 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             upstream_payload = provider_payload(payload, payload.model)
         except ValueError as exc:
             return _error(400, str(exc), "invalid_request_error", "unsupported_parameter")
+
+        global_sem: asyncio.Semaphore = request.app.state.global_semaphore
+        try:
+            await asyncio.wait_for(global_sem.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            return _error(503, "Gateway concurrency limit exceeded.", "gateway_error", "server_busy", {"Retry-After": "1"})
+
+        client_semaphores: dict[str, asyncio.Semaphore] = request.app.state.client_semaphores
+        client_sem = client_semaphores.setdefault(
+            client["client_id"],
+            asyncio.Semaphore(cfg.settings.max_client_concurrent_requests),
+        )
+        try:
+            await asyncio.wait_for(client_sem.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            global_sem.release()
+            return _error(
+                429,
+                "Too many concurrent requests for this API key.",
+                "rate_limit_error",
+                "too_many_concurrent_requests",
+                {"Retry-After": "1"},
+            )
+
+        released = False
+
+        def release_slots() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                client_sem.release()
+                global_sem.release()
+
         started = time.monotonic()
         if payload.stream:
             return StreamingResponse(
-                _stream_chat(database, cfg, client, payload.model, providers, upstream_payload, request.app.state.http_transport, started, clients=request.app.state.http_clients),
+                _stream_chat(
+                    database,
+                    cfg,
+                    client,
+                    payload.model,
+                    providers,
+                    upstream_payload,
+                    request.app.state.http_transport,
+                    started,
+                    clients=request.app.state.http_clients,
+                    release_slots=release_slots,
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
@@ -190,6 +258,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             except Exception:
                 logger.warning("Failed to persist error request log entry")
             return _error(502, "The gateway could not complete the request.", "gateway_error", "gateway_internal")
+        finally:
+            release_slots()
         try:
             await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
         except Exception:
@@ -202,7 +272,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
 async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str, Any], alias: str,
                        providers: list[ProviderConfig], base_payload: dict[str, Any],
                        transport: httpx.AsyncBaseTransport | None, started: float,
-                       clients: SharedHttpClients | None = None):
+                       clients: SharedHttpClients | None = None,
+                       release_slots: Callable[[], None] | None = None):
     stream_deadline = started + min(600.0, cfg.settings.provider_timeout_seconds * 10)
     final_provider: str | None = None
     error_category: str | None = None
@@ -215,6 +286,7 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             emitted = False
             event_lines: list[str] = []
             event_size = 0
+            total_stream_bytes = 0
             saw_done = False
             try:
                 async with borrow_http_client(provider, cfg.settings.provider_timeout_seconds, transport=transport, clients=clients) as http:
@@ -243,9 +315,27 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                             final_status = 502
                             yield _safe_error_event(error_category)
                             return
-                        async for line in response.aiter_lines():
-                            if time.monotonic() > stream_deadline:
+                        lines_iter = response.aiter_lines().__aiter__()
+                        received_first_line = False
+                        while True:
+                            remaining_deadline = stream_deadline - time.monotonic()
+                            if remaining_deadline <= 0:
                                 raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted)
+                            step_timeout = (
+                                cfg.settings.provider_timeout_seconds
+                                if not received_first_line
+                                else cfg.settings.stream_idle_timeout_seconds
+                            )
+                            try:
+                                line = await asyncio.wait_for(
+                                    lines_iter.__anext__(),
+                                    timeout=min(remaining_deadline, step_timeout),
+                                )
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted) from None
+                            received_first_line = True
                             if line == "":
                                 if event_lines:
                                     data = _parse_sse_data(event_lines)
@@ -269,7 +359,11 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                         if data is not None:
                                             emitted = True
                                 continue
-                            event_size += len(line.encode("utf-8"))
+                            line_bytes = len(line.encode("utf-8"))
+                            event_size += line_bytes
+                            total_stream_bytes += line_bytes + 1
+                            if total_stream_bytes > cfg.settings.max_stream_bytes:
+                                raise ProviderFailure("provider_stream_too_large", 502, False)
                             if event_size > 65536:
                                 raise ProviderFailure("provider_event_too_large", 502, False)
                             event_lines.append(line)
@@ -304,6 +398,8 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
         final_status = 499
         raise
     finally:
+        if release_slots is not None:
+            release_slots()
         with anyio.CancelScope(shield=True):
             try:
                 await asyncio.to_thread(

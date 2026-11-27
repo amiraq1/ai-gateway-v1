@@ -22,4 +22,4 @@ USER 10001:10001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import os, urllib.request, sys; port = os.environ.get('GATEWAY_PORT', '8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3).getcode() == 200 else 1)"
 
-CMD ["sh", "-c", "umask 077 && exec uvicorn app.main:create_app --factory --host \"${GATEWAY_HOST:-0.0.0.0}\" --port \"${GATEWAY_PORT:-8000}\" --timeout-graceful-shutdown 15 --no-access-log"]
+CMD ["sh", "-c", "umask 077 && exec uvicorn app.main:create_app --factory --host \"${GATEWAY_HOST:-0.0.0.0}\" --port \"${GATEWAY_PORT:-8000}\" --limit-concurrency 64 --timeout-graceful-shutdown 15 --no-access-log"]
