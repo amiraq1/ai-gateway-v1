@@ -65,7 +65,6 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         return conn
 
@@ -92,6 +91,7 @@ class Database:
             try:
                 Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 with self.connect() as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
                     self.migrate(conn)
                 try:
                     os.chmod(self.path, 0o600)

@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import logging
 import time
 from typing import Any, Callable
 
+import anyio
 import httpx
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
@@ -18,6 +20,13 @@ from .models import ChatCompletionRequest, provider_payload
 from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, SharedHttpClients, _headers, borrow_http_client, complete
 from .secret_loader import SecretLoadError, resolve_secret
 from .ssrf import create_safe_transport
+
+logger = logging.getLogger("ai_gateway")
+
+
+def _check_db_health(database: Database) -> None:
+    with database.connect() as conn:
+        conn.execute("SELECT 1").fetchone()
 
 
 class BoundedBodyMiddleware:
@@ -112,10 +121,10 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         if not authorization or not authorization.startswith("Bearer "):
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         try:
-            pepper = resolve_secret("GATEWAY_PEPPER")
+            pepper = await asyncio.to_thread(resolve_secret, "GATEWAY_PEPPER")
         except SecretLoadError:
             return _error(503, "Gateway authentication is unavailable.", "gateway_error", "secret_unavailable")
-        client = authenticate_key(database, pepper, authorization[7:])
+        client = await asyncio.to_thread(authenticate_key, database, pepper, authorization[7:])
         if not client:
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         return client
@@ -123,8 +132,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         try:
-            with database.connect() as conn:
-                conn.execute("SELECT 1").fetchone()
+            await asyncio.to_thread(_check_db_health, database)
         except Exception:
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return {"status": "ok"}
@@ -140,7 +148,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     async def chat_completions(payload: ChatCompletionRequest, request: Request, client: dict[str, Any] | JSONResponse = Depends(get_client)) -> Any:
         if isinstance(client, JSONResponse):
             return client
-        allowed, retry_after = database.consume_rate_limit(client["client_id"], int(client["rpm"]))
+        allowed, retry_after = await asyncio.to_thread(database.consume_rate_limit, client["client_id"], int(client["rpm"]))
         if not allowed:
             return _error(429, "Rate limit exceeded.", "rate_limit_error", "rate_limit_exceeded", {"Retry-After": str(retry_after)})
         providers = cfg.providers_for(payload.model)
@@ -160,20 +168,20 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         try:
             data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport, clients=request.app.state.http_clients)
             data["model"] = payload.model
-            database.log_request(make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
+            await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
             return data
         except ProviderFailure as failure:
             status = failure.status_code
             try:
-                database.log_request(make_request_log(client["client_id"], payload.model, None, status, (time.monotonic() - started) * 1000, None, failure.category, cfg.settings.retention_days))
+                await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, None, status, (time.monotonic() - started) * 1000, None, failure.category, cfg.settings.retention_days))
             except Exception:
                 return _error(503, "Gateway storage is unavailable.", "gateway_error", "storage_unavailable")
             return _error(status, "The upstream provider could not complete the request.", "gateway_error", failure.category)
         except Exception:
             try:
-                database.log_request(make_request_log(client["client_id"], payload.model, None, 502, (time.monotonic() - started) * 1000, None, "gateway_internal", cfg.settings.retention_days))
+                await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, None, 502, (time.monotonic() - started) * 1000, None, "gateway_internal", cfg.settings.retention_days))
             except Exception:
-                pass
+                logger.warning("Failed to persist error request log entry")
             return _error(502, "The gateway could not complete the request.", "gateway_error", "gateway_internal")
 
     return app
@@ -283,10 +291,21 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
         final_status = 499
         raise
     finally:
-        try:
-            database.log_request(make_request_log(client["client_id"], alias, final_provider, final_status,
-                                                  (time.monotonic() - started) * 1000, usage,
-                                                  error_category, cfg.settings.retention_days))
-        except Exception:
-            # Never place prompts, provider bodies, or exception strings in logs.
-            pass
+        with anyio.CancelScope(shield=True):
+            try:
+                await asyncio.to_thread(
+                    database.log_request,
+                    make_request_log(
+                        client["client_id"],
+                        alias,
+                        final_provider,
+                        final_status,
+                        (time.monotonic() - started) * 1000,
+                        usage,
+                        error_category,
+                        cfg.settings.retention_days,
+                    ),
+                )
+            except Exception:
+                # Never place prompts, provider bodies, or exception strings in logs.
+                logger.warning("Failed to persist stream request log entry")
