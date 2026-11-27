@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import time
 from typing import Any, Callable
@@ -14,7 +15,7 @@ from .auth import authenticate_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
-from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, _headers, complete
+from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, SharedHttpClients, _headers, borrow_http_client, complete
 from .secret_loader import SecretLoadError, resolve_secret
 from .ssrf import create_safe_transport
 
@@ -83,7 +84,16 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     cfg = config or load_config()
     database = db or Database(cfg.settings.database_path)
     database.init()
-    app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @asynccontextmanager
+    async def lifespan(fastapi_app: FastAPI):
+        fastapi_app.state.http_clients.ensure_initialized()
+        try:
+            yield
+        finally:
+            await fastapi_app.state.http_clients.aclose()
+
+    app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway_config = cfg
     app.state.database = database
     app.state.http_transports = {
@@ -91,6 +101,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         True: create_safe_transport(allow_private_hosts=True),
     }
     app.state.http_transport = app.state.http_transports
+    app.state.http_clients = SharedHttpClients(app.state.http_transports, cfg.settings.provider_timeout_seconds)
     app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
 
     @app.exception_handler(RequestValidationError)
@@ -142,12 +153,12 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         started = time.monotonic()
         if payload.stream:
             return StreamingResponse(
-                _stream_chat(database, cfg, client, payload.model, providers, upstream_payload, request.app.state.http_transport, started),
+                _stream_chat(database, cfg, client, payload.model, providers, upstream_payload, request.app.state.http_transport, started, clients=request.app.state.http_clients),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
         try:
-            data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport)
+            data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport, clients=request.app.state.http_clients)
             data["model"] = payload.model
             database.log_request(make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
             return data
@@ -170,7 +181,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
 
 async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str, Any], alias: str,
                        providers: list[ProviderConfig], base_payload: dict[str, Any],
-                       transport: httpx.AsyncBaseTransport | None, started: float):
+                       transport: httpx.AsyncBaseTransport | None, started: float,
+                       clients: SharedHttpClients | None = None):
     stream_deadline = started + min(600.0, cfg.settings.provider_timeout_seconds * 10)
     final_provider: str | None = None
     error_category: str | None = None
@@ -184,14 +196,9 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             event_lines: list[str] = []
             event_size = 0
             saw_done = False
-            provider_transport = transport
-            if isinstance(transport, dict):
-                provider_transport = transport.get(provider.allow_private_hosts)
-            elif transport is None:
-                provider_transport = create_safe_transport(allow_private_hosts=provider.allow_private_hosts)
             try:
-                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=provider_transport, follow_redirects=False) as http:
-                    async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider)) as response:
+                async with borrow_http_client(provider, cfg.settings.provider_timeout_seconds, transport=transport, clients=clients) as http:
+                    async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider), timeout=cfg.settings.provider_timeout_seconds) as response:
                         if response.status_code in RETRYABLE_STATUS:
                             await response.aread()
                             if index + 1 < len(attempt_providers):
