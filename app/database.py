@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -216,14 +217,32 @@ class Database:
             return int(clients), int(logs)
 
     def backup_to(self, destination: str) -> None:
-        target = sqlite3.connect(destination)
+        dest_path = Path(destination)
+        dest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{dest_path.name}.",
+            suffix=".tmp",
+            dir=str(dest_path.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
         try:
-            with self.connect() as source:
-                source.backup(target)
-            target.commit()
-        finally:
-            target.close()
-        try:
-            os.chmod(destination, 0o600)
-        except OSError:
-            pass
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            target = sqlite3.connect(str(tmp_path))
+            try:
+                with self.connect() as source:
+                    source.backup(target)
+                target.commit()
+            finally:
+                target.close()
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, dest_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise

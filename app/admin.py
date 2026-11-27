@@ -35,7 +35,8 @@ def main() -> int:
         except SecretLoadError:
             parser.exit(2, "error: required secret is unavailable.\n")
     db = Database(config.settings.database_path)
-    db.init()
+    if args.command != "backup":
+        db.init()
     if args.command == "create-key":
         if pepper is None:
             parser.exit(2, "error: required secret is unavailable.\n")
