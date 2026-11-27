@@ -119,34 +119,42 @@ def _parse_sse_data(lines: list[str]) -> str | None:
 class DisconnectAwareStreamingResponse(StreamingResponse):
     """StreamingResponse that cancels upstream work on http.disconnect across all ASGI versions."""
 
+    def __init__(self, *args: Any, on_cleanup: Callable[[], None] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_cleanup = on_cleanup
+
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") != "http":
-            await super().__call__(scope, receive, send)
-            return
-        async with anyio.create_task_group() as tg:
-            async def run_stream() -> None:
-                try:
-                    await self.stream_response(send)
-                except OSError:
-                    pass
-                finally:
-                    aclose = getattr(self.body_iterator, "aclose", None)
-                    if callable(aclose):
-                        with anyio.CancelScope(shield=True):
-                            await aclose()
-                    tg.cancel_scope.cancel()
-
-            async def watch_disconnect() -> None:
-                while True:
-                    message = await receive()
-                    if message["type"] == "http.disconnect":
+        try:
+            if scope.get("type") != "http":
+                await super().__call__(scope, receive, send)
+                return
+            async with anyio.create_task_group() as tg:
+                async def run_stream() -> None:
+                    try:
+                        await self.stream_response(send)
+                    except OSError:
+                        pass
+                    finally:
+                        aclose = getattr(self.body_iterator, "aclose", None)
+                        if callable(aclose):
+                            with anyio.CancelScope(shield=True):
+                                await aclose()
                         tg.cancel_scope.cancel()
-                        break
 
-            tg.start_soon(run_stream)
-            await watch_disconnect()
-        if self.background is not None:
-            await self.background()
+                async def watch_disconnect() -> None:
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            tg.cancel_scope.cancel()
+                            break
+
+                tg.start_soon(run_stream)
+                await watch_disconnect()
+            if self.background is not None:
+                await self.background()
+        finally:
+            if self._on_cleanup is not None:
+                self._on_cleanup()
 
 
 class _ClientDisconnectedError(Exception):
@@ -312,22 +320,27 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
 
         started = time.monotonic()
         if payload.stream:
-            return DisconnectAwareStreamingResponse(
-                _stream_chat(
-                    database,
-                    cfg,
-                    client,
-                    payload.model,
-                    providers,
-                    upstream_payload,
-                    request.app.state.http_transport,
-                    started,
-                    clients=request.app.state.http_clients,
-                    release_slots=release_slots,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-            )
+            try:
+                return DisconnectAwareStreamingResponse(
+                    _stream_chat(
+                        database,
+                        cfg,
+                        client,
+                        payload.model,
+                        providers,
+                        upstream_payload,
+                        request.app.state.http_transport,
+                        started,
+                        clients=request.app.state.http_clients,
+                        release_slots=release_slots,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+                    on_cleanup=release_slots,
+                )
+            except BaseException:
+                release_slots()
+                raise
         try:
             data, provider_name, usage = await _complete_with_disconnect(
                 request,
