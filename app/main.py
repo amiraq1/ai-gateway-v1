@@ -291,6 +291,11 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         providers = cfg.providers_for(payload.model)
         if not providers:
             return _error(404, "The requested model is not available.", "invalid_request_error", "model_not_found")
+        requested_tokens = payload.max_tokens if payload.max_tokens is not None else payload.max_completion_tokens
+        if requested_tokens is not None and requested_tokens > cfg.settings.max_request_output_tokens:
+            return _error(400, "Requested output token limit exceeds gateway cap.", "invalid_request_error", "max_tokens_exceeded")
+        if payload.n is not None and payload.n > cfg.settings.max_request_choices:
+            return _error(400, "Requested choice count exceeds gateway cap.", "invalid_request_error", "n_exceeded")
         try:
             upstream_payload = provider_payload(payload, payload.model)
         except ValueError as exc:

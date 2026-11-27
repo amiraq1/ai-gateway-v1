@@ -439,3 +439,57 @@ def test_streaming_releases_semaphores_when_send_fails_before_stream_starts(tmp_
     asyncio.run(scenario())
 
 
+def test_cost_caps_reject_excess_output_tokens_and_choices_before_upstream(gateway):
+    app, db = gateway
+    upstream_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    app.state.http_transport = httpx.MockTransport(handler)
+    token = create_client_key(db, PEPPER, "cost-caps", 20)[1]
+
+    with TestClient(app) as client:
+        r_tok = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16385},
+        )
+        r_comp_tok = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 16385},
+        )
+        r_n = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "n": 3},
+        )
+        assert upstream_requests == []
+        assert r_tok.status_code == 400
+        assert r_tok.json()["error"]["code"] == "max_tokens_exceeded"
+        assert r_comp_tok.status_code == 400
+        assert r_comp_tok.json()["error"]["code"] == "max_tokens_exceeded"
+        assert r_n.status_code == 400
+        assert r_n.json()["error"]["code"] == "n_exceeded"
+
+        r_ok = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16384, "n": 2},
+        )
+        assert r_ok.status_code == 200
+        assert len(upstream_requests) == 1
+
+
+
