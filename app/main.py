@@ -235,9 +235,10 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway_config = cfg
     app.state.database = database
+    pool_max_connections = max(64, cfg.settings.max_concurrent_requests)
     app.state.http_transports = {
-        False: create_safe_transport(allow_private_hosts=False),
-        True: create_safe_transport(allow_private_hosts=True),
+        False: create_safe_transport(allow_private_hosts=False, max_connections=pool_max_connections),
+        True: create_safe_transport(allow_private_hosts=True, max_connections=pool_max_connections),
     }
     app.state.http_transport = app.state.http_transports
     app.state.http_clients = SharedHttpClients(app.state.http_transports, cfg.settings.provider_timeout_seconds)
