@@ -161,3 +161,21 @@ def test_streaming_disconnect_cancels_upstream_across_asgi_versions(tmp_path, mo
         assert row["error_category"] == "client_disconnected"
 
     asyncio.run(scenario())
+
+
+def test_non_streaming_preserves_provider_failure_status_503_and_category(tmp_path, monkeypatch):
+    app, db, token = _build_app(tmp_path, monkeypatch)
+    monkeypatch.delenv("TEST_PRIMARY_API_KEY", raising=False)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY_FILE", str(tmp_path / "missing-secret"))
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "provider_secret_unavailable"

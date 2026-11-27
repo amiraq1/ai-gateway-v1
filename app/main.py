@@ -162,11 +162,12 @@ async def _complete_with_disconnect(
     clients: SharedHttpClients,
 ) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
     result: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
+    captured_exc: Exception | None = None
     disconnected = False
 
     async with anyio.create_task_group() as tg:
         async def run_complete() -> None:
-            nonlocal result
+            nonlocal result, captured_exc
             try:
                 result = await complete(
                     providers,
@@ -175,6 +176,8 @@ async def _complete_with_disconnect(
                     transport,
                     clients=clients,
                 )
+            except Exception as exc:
+                captured_exc = exc
             finally:
                 tg.cancel_scope.cancel()
 
@@ -190,7 +193,11 @@ async def _complete_with_disconnect(
         tg.start_soon(watch_disconnect)
         await run_complete()
 
-    if disconnected or result is None:
+    if disconnected:
+        raise _ClientDisconnectedError()
+    if captured_exc is not None:
+        raise captured_exc
+    if result is None:
         raise _ClientDisconnectedError()
     return result
 
