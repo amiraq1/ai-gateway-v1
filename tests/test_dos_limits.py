@@ -302,3 +302,55 @@ def test_streaming_holds_concurrency_slot_until_stream_finishes(tmp_path, monkey
             await asyncio.wait_for(stream_task, timeout=2.0)
 
     asyncio.run(scenario())
+
+
+class UnboundedNoNewlineStream(httpx.AsyncByteStream):
+    def __init__(self, chunk_count: int = 100, chunk_bytes: int = 128 * 1024):
+        self.chunk_count = chunk_count
+        self.chunk_bytes = chunk_bytes
+        self.bytes_yielded = 0
+
+    async def __aiter__(self):
+        chunk = b"A" * self.chunk_bytes
+        for _ in range(self.chunk_count):
+            self.bytes_yielded += len(chunk)
+            yield chunk
+            await asyncio.sleep(0)
+
+    async def aclose(self):
+        return None
+
+
+def test_stream_aborts_long_line_without_newline_before_buffering_all(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY", "secret")
+    settings = GatewaySettings(
+        "127.0.0.1",
+        8000,
+        str(tmp_path / "no_newline_stream.sqlite3"),
+        5.0,
+        1_048_576,
+        30,
+        max_stream_bytes=10 * 1024 * 1024,
+    )
+    provider = ProviderConfig("primary", "m", "https://primary.example/v1", "TEST_PRIMARY_API_KEY", True)
+    cfg = GatewayConfig(settings, {"fast": ModelConfig("fast", True, (provider,))})
+    db = Database(settings.database_path)
+    app = create_app(cfg, db)
+    stream = UnboundedNoNewlineStream(chunk_count=40, chunk_bytes=32 * 1024)
+    app.state.http_transport = httpx.MockTransport(
+        lambda req: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+    )
+    token = create_client_key(db, PEPPER, "no-nl-cap", 20)[1]
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert "provider_event_too_large" in resp.text
+    assert "[DONE]" not in resp.text
+    assert stream.bytes_yielded <= 128 * 1024
+

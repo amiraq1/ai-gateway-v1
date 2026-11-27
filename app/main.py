@@ -427,27 +427,50 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                             final_status = 502
                             yield _safe_error_event(error_category)
                             return
-                        lines_iter = response.aiter_lines().__aiter__()
-                        received_first_line = False
+                        bytes_iter = response.aiter_bytes().__aiter__()
+                        line_buf = bytearray()
+                        pending_lines: list[str] = []
+                        received_first_chunk = False
                         while True:
-                            remaining_deadline = stream_deadline - time.monotonic()
-                            if remaining_deadline <= 0:
-                                raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted)
-                            step_timeout = (
-                                cfg.settings.provider_timeout_seconds
-                                if not received_first_line
-                                else cfg.settings.stream_idle_timeout_seconds
-                            )
-                            try:
-                                line = await asyncio.wait_for(
-                                    lines_iter.__anext__(),
-                                    timeout=min(remaining_deadline, step_timeout),
+                            while not pending_lines:
+                                remaining_deadline = stream_deadline - time.monotonic()
+                                if remaining_deadline <= 0:
+                                    raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted)
+                                step_timeout = (
+                                    cfg.settings.provider_timeout_seconds
+                                    if not received_first_chunk
+                                    else cfg.settings.stream_idle_timeout_seconds
                                 )
-                            except StopAsyncIteration:
+                                try:
+                                    chunk = await asyncio.wait_for(
+                                        bytes_iter.__anext__(),
+                                        timeout=min(remaining_deadline, step_timeout),
+                                    )
+                                except StopAsyncIteration:
+                                    if line_buf:
+                                        if len(line_buf) > 65536:
+                                            raise ProviderFailure("provider_event_too_large", 502, False)
+                                        pending_lines.append(line_buf.rstrip(b"\r").decode("utf-8", errors="replace"))
+                                        line_buf.clear()
+                                    break
+                                except asyncio.TimeoutError:
+                                    raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted) from None
+                                received_first_chunk = True
+                                total_stream_bytes += len(chunk)
+                                if total_stream_bytes > cfg.settings.max_stream_bytes:
+                                    raise ProviderFailure("provider_stream_too_large", 502, False)
+                                line_buf.extend(chunk)
+                                while b"\n" in line_buf:
+                                    raw_line, _, rest = line_buf.partition(b"\n")
+                                    line_buf = bytearray(rest)
+                                    if len(raw_line) > 65536:
+                                        raise ProviderFailure("provider_event_too_large", 502, False)
+                                    pending_lines.append(raw_line.rstrip(b"\r").decode("utf-8", errors="replace"))
+                                if len(line_buf) > 65536:
+                                    raise ProviderFailure("provider_event_too_large", 502, False)
+                            if not pending_lines:
                                 break
-                            except asyncio.TimeoutError:
-                                raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted) from None
-                            received_first_line = True
+                            line = pending_lines.pop(0)
                             if line == "":
                                 if event_lines:
                                     data = _parse_sse_data(event_lines)
@@ -471,11 +494,7 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                         if data is not None:
                                             emitted = True
                                 continue
-                            line_bytes = len(line.encode("utf-8"))
-                            event_size += line_bytes
-                            total_stream_bytes += line_bytes + 1
-                            if total_stream_bytes > cfg.settings.max_stream_bytes:
-                                raise ProviderFailure("provider_stream_too_large", 502, False)
+                            event_size += len(line.encode("utf-8"))
                             if event_size > 65536:
                                 raise ProviderFailure("provider_event_too_large", 502, False)
                             event_lines.append(line)
