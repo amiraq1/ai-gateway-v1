@@ -60,3 +60,18 @@ def test_compose_uses_docker_file_secrets_for_pepper():
 def test_dockerfile_declares_stopsignal_sigterm():
     dockerfile_text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "STOPSIGNAL SIGTERM" in dockerfile_text
+
+
+def test_init_env_and_readme_align_with_docker_file_secrets():
+    init_script = (REPO_ROOT / "scripts" / "init_env.sh").read_text(encoding="utf-8")
+    assert "secrets/gateway_pepper" in init_script
+    assert "0400" in init_script
+    assert "10001:10001" in init_script
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "secrets/gateway_pepper" in readme
+    assert "10001:10001" in readme
+    assert "0400" in readme
+    assert "OPENAI_API_KEY_FILE=/run/secrets/openai_api_key" in readme
+    assert ">> .env" not in readme
+

@@ -44,11 +44,13 @@
 - Docker وDocker Compose (أو بايثون 3.12+ لبيئة التطوير المحلية).
 
 ### 2. التهيئة وتوليد الأسرار
-شغّل سكربت التهيئة لتوليد قيمة Pepper تشفيرية عشوائية داخل ملف `.env` (لا تُطبع القيمة على الشاشة):
+شغّل سكربت التهيئة لتوليد قيمة Pepper تشفيرية عشوائية داخل ملف `secrets/gateway_pepper` المتوافق مع Docker secrets في `docker-compose.yml` (لا تُطبع القيمة على الشاشة):
 
 ```bash
 chmod +x scripts/*.sh
 ./scripts/init_env.sh
+# على مضيف Linux (عند التشغيل بدون rootless userns)، اضبط ملكية وصلاحية ملف السر لمستخدم الحاوية 10001:10001:
+sudo chown 10001:10001 secrets/gateway_pepper && sudo chmod 0400 secrets/gateway_pepper
 ```
 
 ### 3. إعداد المزودات
@@ -58,12 +60,14 @@ chmod +x scripts/*.sh
 cp config/config.example.yaml config/config.yaml
 ```
 
-عدّل `config/config.yaml` وحدد اسم متغير البيئة للمفتاح (مثل `OPENAI_API_KEY`)، ثم أضف المفتاح الفعلي إلى `.env`:
+عدّل `config/config.yaml` وحدد اسم متغير البيئة للمفتاح (مثل `OPENAI_API_KEY`)، ثم أنشئ ملف السر المقابل تحت `secrets/` واضبط ملكيته وصلاحيته، وفعّل أسطر `OPENAI_API_KEY_FILE=/run/secrets/openai_api_key` و`secrets:` في `docker-compose.yml`:
 
 ```bash
-echo "OPENAI_API_KEY=sk-your-real-key" >> .env
-chmod 0600 .env
+umask 077
+printf "%s" "sk-your-real-key" > secrets/openai_api_key
+sudo chown 10001:10001 secrets/openai_api_key && sudo chmod 0400 secrets/openai_api_key
 ```
+> للتشغيل المحلي خارج Docker فقط يمكن تمرير `GATEWAY_PEPPER` و`OPENAI_API_KEY` كمتغيرات بيئة مباشرة (لا تمرّر Docker Compose ملف `.env` تلقائيًا إلى الحاوية).
 
 ### 4. التشغيل عبر Docker Compose
 يتم تشغيل الحاوية داخل شبكة جسر خاصة (`gateway_internal`) مع ربط صارم لمنفذ المضيف على `127.0.0.1:8000`:

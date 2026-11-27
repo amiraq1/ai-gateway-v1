@@ -88,3 +88,63 @@ def test_authenticate_key_timing_equalization_and_forgery(tmp_path):
 
     # Valid key returns client
     assert authenticate_key(db, PEPPER, raw)["client_id"] == client_id
+
+
+def test_digest_rejects_known_placeholder_pepper():
+    import pytest
+
+    with pytest.raises(ValueError, match="placeholder"):
+        digest_key("gw_test.secret", "REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES")
+
+
+def test_create_app_fails_closed_on_missing_short_or_placeholder_pepper(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from app.main import create_app
+    from app.secret_loader import SecretLoadError
+
+    cfg_path = tmp_path / "config.yaml"
+    db_path = tmp_path / "startup.sqlite3"
+    cfg_path.write_text(json.dumps({"settings": {"database_path": str(db_path)}, "models": {}}), encoding="utf-8")
+    monkeypatch.setenv("GATEWAY_CONFIG", str(cfg_path))
+    monkeypatch.delenv("GATEWAY_PEPPER_FILE", raising=False)
+
+    monkeypatch.delenv("GATEWAY_PEPPER", raising=False)
+    with pytest.raises(SecretLoadError):
+        create_app()
+
+    monkeypatch.setenv("GATEWAY_PEPPER", "short")
+    with pytest.raises(ValueError, match="32 bytes"):
+        create_app()
+
+    monkeypatch.setenv("GATEWAY_PEPPER", "REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES")
+    with pytest.raises(ValueError, match="placeholder"):
+        create_app()
+
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    app = create_app()
+    assert app is not None
+
+
+def test_healthz_returns_503_when_pepper_unavailable_or_invalid(gateway, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    app, _ = gateway
+    client = TestClient(app)
+
+    monkeypatch.delenv("GATEWAY_PEPPER", raising=False)
+    monkeypatch.delenv("GATEWAY_PEPPER_FILE", raising=False)
+    r_missing = client.get("/healthz")
+    assert r_missing.status_code == 503
+    assert r_missing.json() == {"status": "unavailable"}
+
+    monkeypatch.setenv("GATEWAY_PEPPER", "short")
+    r_short = client.get("/healthz")
+    assert r_short.status_code == 503
+    assert r_short.json() == {"status": "unavailable"}
+
+    monkeypatch.setenv("GATEWAY_PEPPER", "REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES")
+    r_placeholder = client.get("/healthz")
+    assert r_placeholder.status_code == 503
+    assert r_placeholder.json() == {"status": "unavailable"}
+

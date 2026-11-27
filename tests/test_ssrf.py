@@ -124,3 +124,19 @@ def test_validate_ssrf_url_normalizes_trailing_dot(trailing_dot_url):
     with pytest.raises(ValueError):
         validate_ssrf_url(trailing_dot_url, "test-provider", allow_private_hosts=False)
 
+
+def test_aws_ipv6_imdsv2_blocked_even_with_allow_private_hosts():
+    assert is_ip_forbidden("fd00:ec2::254", allow_private_hosts=True) is True
+    with pytest.raises(ValueError):
+        validate_ssrf_url("http://[fd00:ec2::254]/latest/meta-data/", "aws-meta", allow_private_hosts=True)
+
+
+def test_safe_ssrf_transport_pool_max_connections_exceeds_default_10():
+    from app.ssrf import SafeSSRFTransport, create_safe_transport
+
+    default_transport = SafeSSRFTransport()
+    assert default_transport._pool._max_connections >= 64
+    scaled = create_safe_transport(max_connections=128)
+    assert scaled._pool._max_connections == 128
+
+

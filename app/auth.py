@@ -9,7 +9,12 @@ from typing import Any
 from .database import Database
 
 
+_FORBIDDEN_PEPPERS = frozenset({"REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES"})
+
+
 def digest_key(raw_key: str, pepper: str) -> str:
+    if pepper in _FORBIDDEN_PEPPERS:
+        raise ValueError("GATEWAY_PEPPER must not use a known placeholder value")
     if len(pepper.encode("utf-8")) < 32:
         raise ValueError("GATEWAY_PEPPER must contain at least 32 bytes")
     return hmac.new(pepper.encode("utf-8"), raw_key.encode("utf-8"), hashlib.sha256).hexdigest()

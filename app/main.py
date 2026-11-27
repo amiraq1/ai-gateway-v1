@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .auth import authenticate_key, make_request_log
+from .auth import authenticate_key, digest_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
@@ -36,6 +36,12 @@ logger = logging.getLogger("ai_gateway")
 def _check_db_health(database: Database) -> None:
     with database.connect() as conn:
         conn.execute("SELECT 1").fetchone()
+
+
+def _check_gateway_health(database: Database) -> None:
+    _check_db_health(database)
+    pepper = resolve_secret("GATEWAY_PEPPER")
+    digest_key("healthz-check", pepper)
 
 
 class BoundedBodyMiddleware:
@@ -119,34 +125,42 @@ def _parse_sse_data(lines: list[str]) -> str | None:
 class DisconnectAwareStreamingResponse(StreamingResponse):
     """StreamingResponse that cancels upstream work on http.disconnect across all ASGI versions."""
 
+    def __init__(self, *args: Any, on_cleanup: Callable[[], None] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_cleanup = on_cleanup
+
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") != "http":
-            await super().__call__(scope, receive, send)
-            return
-        async with anyio.create_task_group() as tg:
-            async def run_stream() -> None:
-                try:
-                    await self.stream_response(send)
-                except OSError:
-                    pass
-                finally:
-                    aclose = getattr(self.body_iterator, "aclose", None)
-                    if callable(aclose):
-                        with anyio.CancelScope(shield=True):
-                            await aclose()
-                    tg.cancel_scope.cancel()
-
-            async def watch_disconnect() -> None:
-                while True:
-                    message = await receive()
-                    if message["type"] == "http.disconnect":
+        try:
+            if scope.get("type") != "http":
+                await super().__call__(scope, receive, send)
+                return
+            async with anyio.create_task_group() as tg:
+                async def run_stream() -> None:
+                    try:
+                        await self.stream_response(send)
+                    except OSError:
+                        pass
+                    finally:
+                        aclose = getattr(self.body_iterator, "aclose", None)
+                        if callable(aclose):
+                            with anyio.CancelScope(shield=True):
+                                await aclose()
                         tg.cancel_scope.cancel()
-                        break
 
-            tg.start_soon(run_stream)
-            await watch_disconnect()
-        if self.background is not None:
-            await self.background()
+                async def watch_disconnect() -> None:
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            tg.cancel_scope.cancel()
+                            break
+
+                tg.start_soon(run_stream)
+                await watch_disconnect()
+            if self.background is not None:
+                await self.background()
+        finally:
+            if self._on_cleanup is not None:
+                self._on_cleanup()
 
 
 class _ClientDisconnectedError(Exception):
@@ -204,6 +218,9 @@ async def _complete_with_disconnect(
 
 def create_app(config: GatewayConfig | None = None, db: Database | None = None) -> FastAPI:
     cfg = config or load_config()
+    if config is None:
+        pepper = resolve_secret("GATEWAY_PEPPER")
+        digest_key("startup-check", pepper)
     database = db or Database(cfg.settings.database_path)
     database.init()
 
@@ -218,9 +235,10 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway_config = cfg
     app.state.database = database
+    pool_max_connections = max(64, cfg.settings.max_concurrent_requests)
     app.state.http_transports = {
-        False: create_safe_transport(allow_private_hosts=False),
-        True: create_safe_transport(allow_private_hosts=True),
+        False: create_safe_transport(allow_private_hosts=False, max_connections=pool_max_connections),
+        True: create_safe_transport(allow_private_hosts=True, max_connections=pool_max_connections),
     }
     app.state.http_transport = app.state.http_transports
     app.state.http_clients = SharedHttpClients(app.state.http_transports, cfg.settings.provider_timeout_seconds)
@@ -241,7 +259,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         try:
             pepper = await asyncio.to_thread(resolve_secret, "GATEWAY_PEPPER")
-        except SecretLoadError:
+            digest_key("auth-check", pepper)
+        except (SecretLoadError, ValueError):
             return _error(503, "Gateway authentication is unavailable.", "gateway_error", "secret_unavailable")
         client = await asyncio.to_thread(authenticate_key, database, pepper, authorization[7:])
         if not client:
@@ -249,9 +268,9 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         return client
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    async def healthz() -> Any:
         try:
-            await asyncio.to_thread(_check_db_health, database)
+            await asyncio.to_thread(_check_gateway_health, database)
         except Exception:
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return {"status": "ok"}
@@ -273,6 +292,11 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         providers = cfg.providers_for(payload.model)
         if not providers:
             return _error(404, "The requested model is not available.", "invalid_request_error", "model_not_found")
+        requested_tokens = payload.max_tokens if payload.max_tokens is not None else payload.max_completion_tokens
+        if requested_tokens is not None and requested_tokens > cfg.settings.max_request_output_tokens:
+            return _error(400, "Requested output token limit exceeds gateway cap.", "invalid_request_error", "max_tokens_exceeded")
+        if payload.n is not None and payload.n > cfg.settings.max_request_choices:
+            return _error(400, "Requested choice count exceeds gateway cap.", "invalid_request_error", "n_exceeded")
         try:
             upstream_payload = provider_payload(payload, payload.model)
         except ValueError as exc:
@@ -312,22 +336,27 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
 
         started = time.monotonic()
         if payload.stream:
-            return DisconnectAwareStreamingResponse(
-                _stream_chat(
-                    database,
-                    cfg,
-                    client,
-                    payload.model,
-                    providers,
-                    upstream_payload,
-                    request.app.state.http_transport,
-                    started,
-                    clients=request.app.state.http_clients,
-                    release_slots=release_slots,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
-            )
+            try:
+                return DisconnectAwareStreamingResponse(
+                    _stream_chat(
+                        database,
+                        cfg,
+                        client,
+                        payload.model,
+                        providers,
+                        upstream_payload,
+                        request.app.state.http_transport,
+                        started,
+                        clients=request.app.state.http_clients,
+                        release_slots=release_slots,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+                    on_cleanup=release_slots,
+                )
+            except BaseException:
+                release_slots()
+                raise
         try:
             data, provider_name, usage = await _complete_with_disconnect(
                 request,
@@ -427,27 +456,50 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                             final_status = 502
                             yield _safe_error_event(error_category)
                             return
-                        lines_iter = response.aiter_lines().__aiter__()
-                        received_first_line = False
+                        bytes_iter = response.aiter_bytes().__aiter__()
+                        line_buf = bytearray()
+                        pending_lines: list[str] = []
+                        received_first_chunk = False
                         while True:
-                            remaining_deadline = stream_deadline - time.monotonic()
-                            if remaining_deadline <= 0:
-                                raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted)
-                            step_timeout = (
-                                cfg.settings.provider_timeout_seconds
-                                if not received_first_line
-                                else cfg.settings.stream_idle_timeout_seconds
-                            )
-                            try:
-                                line = await asyncio.wait_for(
-                                    lines_iter.__anext__(),
-                                    timeout=min(remaining_deadline, step_timeout),
+                            while not pending_lines:
+                                remaining_deadline = stream_deadline - time.monotonic()
+                                if remaining_deadline <= 0:
+                                    raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted)
+                                step_timeout = (
+                                    cfg.settings.provider_timeout_seconds
+                                    if not received_first_chunk
+                                    else cfg.settings.stream_idle_timeout_seconds
                                 )
-                            except StopAsyncIteration:
+                                try:
+                                    chunk = await asyncio.wait_for(
+                                        bytes_iter.__anext__(),
+                                        timeout=min(remaining_deadline, step_timeout),
+                                    )
+                                except StopAsyncIteration:
+                                    if line_buf:
+                                        if len(line_buf) > 65536:
+                                            raise ProviderFailure("provider_event_too_large", 502, False)
+                                        pending_lines.append(line_buf.rstrip(b"\r").decode("utf-8", errors="replace"))
+                                        line_buf.clear()
+                                    break
+                                except asyncio.TimeoutError:
+                                    raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted) from None
+                                received_first_chunk = True
+                                total_stream_bytes += len(chunk)
+                                if total_stream_bytes > cfg.settings.max_stream_bytes:
+                                    raise ProviderFailure("provider_stream_too_large", 502, False)
+                                line_buf.extend(chunk)
+                                while b"\n" in line_buf:
+                                    raw_line, _, rest = line_buf.partition(b"\n")
+                                    line_buf = bytearray(rest)
+                                    if len(raw_line) > 65536:
+                                        raise ProviderFailure("provider_event_too_large", 502, False)
+                                    pending_lines.append(raw_line.rstrip(b"\r").decode("utf-8", errors="replace"))
+                                if len(line_buf) > 65536:
+                                    raise ProviderFailure("provider_event_too_large", 502, False)
+                            if not pending_lines:
                                 break
-                            except asyncio.TimeoutError:
-                                raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted) from None
-                            received_first_line = True
+                            line = pending_lines.pop(0)
                             if line == "":
                                 if event_lines:
                                     data = _parse_sse_data(event_lines)
@@ -471,11 +523,7 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                         if data is not None:
                                             emitted = True
                                 continue
-                            line_bytes = len(line.encode("utf-8"))
-                            event_size += line_bytes
-                            total_stream_bytes += line_bytes + 1
-                            if total_stream_bytes > cfg.settings.max_stream_bytes:
-                                raise ProviderFailure("provider_stream_too_large", 502, False)
+                            event_size += len(line.encode("utf-8"))
                             if event_size > 65536:
                                 raise ProviderFailure("provider_event_too_large", 502, False)
                             event_lines.append(line)

@@ -22,4 +22,10 @@ fi
 umask 077
 printf "%s" "$PEPPER" > "$PEPPER_FILE"
 chmod 0400 "$PEPPER_FILE" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+    chown 10001:10001 "$SECRETS_DIR" "$PEPPER_FILE" 2>/dev/null || true
+else
+    echo "Note: on Linux hosts, ensure container UID 10001 owns the secret:"
+    echo "  sudo chown 10001:10001 $PEPPER_FILE && sudo chmod 0400 $PEPPER_FILE"
+fi
 echo "secrets/gateway_pepper initialized with secure local pepper."

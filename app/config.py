@@ -59,6 +59,8 @@ class GatewaySettings:
     body_read_timeout_seconds: float = 15.0
     max_concurrent_requests: int = 32
     max_client_concurrent_requests: int = 8
+    max_request_output_tokens: int = 16_384
+    max_request_choices: int = 2
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     body_timeout = float(os.environ.get("BODY_READ_TIMEOUT_SECONDS", raw_settings.get("body_read_timeout_seconds", 15)))
     max_concurrent = int(os.environ.get("MAX_CONCURRENT_REQUESTS", raw_settings.get("max_concurrent_requests", 32)))
     max_client_concurrent = int(os.environ.get("MAX_CLIENT_CONCURRENT_REQUESTS", raw_settings.get("max_client_concurrent_requests", 8)))
+    max_output_tokens = int(os.environ.get("MAX_REQUEST_OUTPUT_TOKENS", raw_settings.get("max_request_output_tokens", 16_384)))
+    max_choices = int(os.environ.get("MAX_REQUEST_CHOICES", raw_settings.get("max_request_choices", 2)))
     if (
         not 1 <= port <= 65535
         or not 1 <= timeout <= 240
@@ -110,6 +114,8 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
         or not 0.1 <= body_timeout <= 120
         or not 1 <= max_concurrent <= 1024
         or not 1 <= max_client_concurrent <= max_concurrent
+        or not 1 <= max_output_tokens <= 1_000_000
+        or not 1 <= max_choices <= 8
     ):
         raise ValueError("Invalid gateway setting range")
     db_path = os.environ.get("GATEWAY_DATABASE_PATH", str(raw_settings.get("database_path", "/tmp/ai-gateway.sqlite3")))
@@ -125,6 +131,8 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
         body_read_timeout_seconds=body_timeout,
         max_concurrent_requests=max_concurrent,
         max_client_concurrent_requests=max_client_concurrent,
+        max_request_output_tokens=max_output_tokens,
+        max_request_choices=max_choices,
     )
 
     raw_models = raw.get("models", {})

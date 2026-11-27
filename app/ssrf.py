@@ -31,6 +31,7 @@ _ALWAYS_FORBIDDEN_NETWORKS = (
     ipaddress.ip_network("ff00::/8"),          # RFC 4291 IPv6 Multicast
     ipaddress.ip_network("100::/64"),          # RFC 6666 IPv6 Discard-Only prefix
     ipaddress.ip_network("2001:db8::/32"),     # RFC 3849 IPv6 Documentation
+    ipaddress.ip_network("fd00:ec2::254/128"), # AWS EC2 IPv6 Instance Metadata (IMDSv2)
 )
 
 _EXPLICIT_FORBIDDEN_NETWORKS = (
@@ -254,18 +255,34 @@ class SafeSSRFTransport(httpx.AsyncHTTPTransport):
     - Uses SafeSSRFNetworkBackend for DNS resolution safety and IP pinning
     """
 
-    def __init__(self, dns_resolver: Any = None, allow_private_hosts: bool = False, **kwargs: Any):
+    def __init__(
+        self,
+        dns_resolver: Any = None,
+        allow_private_hosts: bool = False,
+        max_connections: int = 64,
+        **kwargs: Any,
+    ):
         super().__init__(trust_env=False, **kwargs)
         self.network_backend = SafeSSRFNetworkBackend(dns_resolver=dns_resolver, allow_private_hosts=allow_private_hosts)
         self._pool = httpcore.AsyncConnectionPool(
             ssl_context=self._pool._ssl_context,
             network_backend=self.network_backend,
+            max_connections=max_connections,
+            max_keepalive_connections=min(20, max_connections),
             retries=0,
             http1=True,
             http2=False,
         )
 
 
-def create_safe_transport(dns_resolver: Any = None, allow_private_hosts: bool = False) -> httpx.AsyncBaseTransport:
+def create_safe_transport(
+    dns_resolver: Any = None,
+    allow_private_hosts: bool = False,
+    max_connections: int = 64,
+) -> httpx.AsyncBaseTransport:
     """Create a safe SSRF-hardened transport instance."""
-    return SafeSSRFTransport(dns_resolver=dns_resolver, allow_private_hosts=allow_private_hosts)
+    return SafeSSRFTransport(
+        dns_resolver=dns_resolver,
+        allow_private_hosts=allow_private_hosts,
+        max_connections=max_connections,
+    )

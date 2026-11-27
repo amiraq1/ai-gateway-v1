@@ -302,3 +302,194 @@ def test_streaming_holds_concurrency_slot_until_stream_finishes(tmp_path, monkey
             await asyncio.wait_for(stream_task, timeout=2.0)
 
     asyncio.run(scenario())
+
+
+class UnboundedNoNewlineStream(httpx.AsyncByteStream):
+    def __init__(self, chunk_count: int = 100, chunk_bytes: int = 128 * 1024):
+        self.chunk_count = chunk_count
+        self.chunk_bytes = chunk_bytes
+        self.bytes_yielded = 0
+
+    async def __aiter__(self):
+        chunk = b"A" * self.chunk_bytes
+        for _ in range(self.chunk_count):
+            self.bytes_yielded += len(chunk)
+            yield chunk
+            await asyncio.sleep(0)
+
+    async def aclose(self):
+        return None
+
+
+def test_stream_aborts_long_line_without_newline_before_buffering_all(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY", "secret")
+    settings = GatewaySettings(
+        "127.0.0.1",
+        8000,
+        str(tmp_path / "no_newline_stream.sqlite3"),
+        5.0,
+        1_048_576,
+        30,
+        max_stream_bytes=10 * 1024 * 1024,
+    )
+    provider = ProviderConfig("primary", "m", "https://primary.example/v1", "TEST_PRIMARY_API_KEY", True)
+    cfg = GatewayConfig(settings, {"fast": ModelConfig("fast", True, (provider,))})
+    db = Database(settings.database_path)
+    app = create_app(cfg, db)
+    stream = UnboundedNoNewlineStream(chunk_count=40, chunk_bytes=32 * 1024)
+    app.state.http_transport = httpx.MockTransport(
+        lambda req: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+    )
+    token = create_client_key(db, PEPPER, "no-nl-cap", 20)[1]
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert "provider_event_too_large" in resp.text
+    assert "[DONE]" not in resp.text
+    assert stream.bytes_yielded <= 128 * 1024
+
+
+def test_streaming_releases_semaphores_when_send_fails_before_stream_starts(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("GATEWAY_PEPPER", PEPPER)
+    monkeypatch.setenv("TEST_PRIMARY_API_KEY", "secret")
+    settings = GatewaySettings(
+        "127.0.0.1",
+        8000,
+        str(tmp_path / "sem_leak.sqlite3"),
+        5.0,
+        1_048_576,
+        30,
+        max_concurrent_requests=1,
+        max_client_concurrent_requests=1,
+    )
+    provider = ProviderConfig("primary", "m", "https://primary.example/v1", "TEST_PRIMARY_API_KEY", True)
+    cfg = GatewayConfig(settings, {"fast": ModelConfig("fast", True, (provider,))})
+    db = Database(settings.database_path)
+    app = create_app(cfg, db)
+    client_id, token = create_client_key(db, PEPPER, "sem-leak", 60)
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    app.state.http_transport = httpx.MockTransport(ok_handler)
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            body_bytes = json.dumps(
+                {"model": "fast", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            ).encode("utf-8")
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/v1/chat/completions",
+                "raw_path": b"/v1/chat/completions",
+                "query_string": b"",
+                "headers": [
+                    (b"authorization", f"Bearer {token}".encode("ascii")),
+                    (b"content-type", b"application/json"),
+                ],
+                "client": ("127.0.0.1", 12345),
+                "server": ("127.0.0.1", 8000),
+            }
+            sent_body = False
+
+            async def receive():
+                nonlocal sent_body
+                if not sent_body:
+                    sent_body = True
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                await asyncio.sleep(5)
+                return {"type": "http.disconnect"}
+
+            async def failing_send(_msg):
+                raise ConnectionResetError("client closed before headers")
+
+            await app(scope, receive, failing_send)
+            assert app.state.global_semaphore._value == 1
+            assert app.state.client_semaphores[client_id]._value == 1
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://gateway.local") as client:
+                follow_up = await client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"model": "fast", "stream": False, "messages": [{"role": "user", "content": "after"}]},
+                )
+            assert follow_up.status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_cost_caps_reject_excess_output_tokens_and_choices_before_upstream(gateway):
+    app, db = gateway
+    upstream_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    app.state.http_transport = httpx.MockTransport(handler)
+    token = create_client_key(db, PEPPER, "cost-caps", 20)[1]
+
+    with TestClient(app) as client:
+        r_tok = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16385},
+        )
+        r_comp_tok = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 16385},
+        )
+        r_n = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "n": 3},
+        )
+        assert upstream_requests == []
+        assert r_tok.status_code == 400
+        assert r_tok.json()["error"]["code"] == "max_tokens_exceeded"
+        assert r_comp_tok.status_code == 400
+        assert r_comp_tok.json()["error"]["code"] == "max_tokens_exceeded"
+        assert r_n.status_code == 400
+        assert r_n.json()["error"]["code"] == "n_exceeded"
+
+        r_ok = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16384, "n": 2},
+        )
+        assert r_ok.status_code == 200
+        assert len(upstream_requests) == 1
+
+
+
