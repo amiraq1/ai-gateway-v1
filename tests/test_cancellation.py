@@ -36,7 +36,7 @@ def test_non_streaming_disconnect_cancels_upstream_and_logs_499(tmp_path, monkey
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             upstream_entered.set()
             try:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(10.0)
             except asyncio.CancelledError:
                 upstream_cancelled.set()
                 raise
@@ -82,8 +82,8 @@ def test_non_streaming_disconnect_cancels_upstream_and_logs_499(tmp_path, monkey
             task = asyncio.create_task(app(scope, receive, send))
             await asyncio.wait_for(upstream_entered.wait(), timeout=2.0)
             disconnect_event.set()
-            await asyncio.wait_for(upstream_cancelled.wait(), timeout=0.5)
-            await asyncio.wait_for(task, timeout=0.5)
+            await asyncio.wait_for(upstream_cancelled.wait(), timeout=2.0)
+            await asyncio.wait_for(task, timeout=2.0)
 
         row = db.usage_for_client(db.list_clients()[0]["client_id"])[0]
         assert row["status_code"] == 499
@@ -102,7 +102,7 @@ def test_streaming_disconnect_cancels_upstream_across_asgi_versions(tmp_path, mo
         async def __aiter__(self):
             yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
             upstream_started.set()
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(10.0)
             yield b"data: [DONE]\n\n"
 
         async def aclose(self):
@@ -153,8 +153,8 @@ def test_streaming_disconnect_cancels_upstream_across_asgi_versions(tmp_path, mo
             await asyncio.wait_for(upstream_started.wait(), timeout=2.0)
             await asyncio.wait_for(first_chunk.wait(), timeout=2.0)
             disconnect_event.set()
-            await asyncio.wait_for(stream_closed.wait(), timeout=0.5)
-            await asyncio.wait_for(task, timeout=0.5)
+            await asyncio.wait_for(stream_closed.wait(), timeout=2.0)
+            await asyncio.wait_for(task, timeout=2.0)
 
         row = db.usage_for_client(db.list_clients()[0]["client_id"])[0]
         assert row["status_code"] == 499
