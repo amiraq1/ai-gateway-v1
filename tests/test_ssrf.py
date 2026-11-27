@@ -91,3 +91,36 @@ def test_backend_with_allow_private_hosts_still_blocks_metadata():
     with pytest.raises(httpcore.ConnectError, match="SSRF protection blocked target"):
         asyncio.run(backend.connect_tcp("metadata.example", 80))
 
+
+@pytest.mark.parametrize("ipv6_target", [
+    "2002:a9fe:a9fe::1",                      # 6to4 embedding 169.254.169.254
+    "2001:0:4136:e378:8000:63bf:5601:5601",   # Teredo client embedding 169.254.169.254
+    "2001:0:a9fe:a9fe:8000:0000:f7f7:f7f7",   # Teredo server embedding 169.254.169.254
+    "64:ff9b::169.254.169.254",               # NAT64 WKP embedding 169.254.169.254
+    "64:ff9b:1::169.254.169.254",             # NAT64 local-use /96 embedding 169.254.169.254
+    "64:ff9b:1:0:a9:fea9:fe00:0",             # NAT64 local-use /64 (RFC 6052) embedding 169.254.169.254
+    "::169.254.169.254",                      # IPv4-compatible embedding 169.254.169.254
+])
+def test_transitional_ipv6_metadata_blocked_even_with_allow_private_hosts(ipv6_target):
+    assert is_ip_forbidden(ipv6_target, allow_private_hosts=True) is True
+
+
+@pytest.mark.parametrize("ipv6_private", [
+    "64:ff9b::8.8.8.8",       # NAT64 well-known prefix blocked when private/tunneling disabled
+    "64:ff9b::10.0.0.1",
+    "2002:0a00:0001::1",      # 6to4 10.0.0.1
+    "2001:0:4136:e378:8000:63bf:f5ff:fffe",  # Teredo client 10.0.0.1
+])
+def test_transitional_ipv6_blocked_by_default(ipv6_private):
+    assert is_ip_forbidden(ipv6_private, allow_private_hosts=False) is True
+
+
+@pytest.mark.parametrize("trailing_dot_url", [
+    "https://localhost./v1",
+    "https://api.internal./v1",
+    "https://127.0.0.1./v1",
+])
+def test_validate_ssrf_url_normalizes_trailing_dot(trailing_dot_url):
+    with pytest.raises(ValueError):
+        validate_ssrf_url(trailing_dot_url, "test-provider", allow_private_hosts=False)
+
