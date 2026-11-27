@@ -116,6 +116,85 @@ def _parse_sse_data(lines: list[str]) -> str | None:
     return "\n".join(data_lines) if data_lines else None
 
 
+class DisconnectAwareStreamingResponse(StreamingResponse):
+    """StreamingResponse that cancels upstream work on http.disconnect across all ASGI versions."""
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await super().__call__(scope, receive, send)
+            return
+        async with anyio.create_task_group() as tg:
+            async def run_stream() -> None:
+                try:
+                    await self.stream_response(send)
+                except OSError:
+                    pass
+                finally:
+                    aclose = getattr(self.body_iterator, "aclose", None)
+                    if callable(aclose):
+                        with anyio.CancelScope(shield=True):
+                            await aclose()
+                    tg.cancel_scope.cancel()
+
+            async def watch_disconnect() -> None:
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        tg.cancel_scope.cancel()
+                        break
+
+            tg.start_soon(run_stream)
+            await watch_disconnect()
+        if self.background is not None:
+            await self.background()
+
+
+class _ClientDisconnectedError(Exception):
+    """Raised when an HTTP client disconnects while awaiting a non-streaming completion."""
+
+
+async def _complete_with_disconnect(
+    request: Request,
+    providers: list[ProviderConfig],
+    upstream_payload: dict[str, Any],
+    timeout: float,
+    transport: Any,
+    clients: SharedHttpClients,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+    result: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
+    disconnected = False
+
+    async with anyio.create_task_group() as tg:
+        async def run_complete() -> None:
+            nonlocal result
+            try:
+                result = await complete(
+                    providers,
+                    upstream_payload,
+                    timeout,
+                    transport,
+                    clients=clients,
+                )
+            finally:
+                tg.cancel_scope.cancel()
+
+        async def watch_disconnect() -> None:
+            nonlocal disconnected
+            while True:
+                message = await request.receive()
+                if message["type"] == "http.disconnect":
+                    disconnected = True
+                    tg.cancel_scope.cancel()
+                    return
+
+        tg.start_soon(watch_disconnect)
+        await run_complete()
+
+    if disconnected or result is None:
+        raise _ClientDisconnectedError()
+    return result
+
+
 def create_app(config: GatewayConfig | None = None, db: Database | None = None) -> FastAPI:
     cfg = config or load_config()
     database = db or Database(cfg.settings.database_path)
@@ -226,7 +305,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
 
         started = time.monotonic()
         if payload.stream:
-            return StreamingResponse(
+            return DisconnectAwareStreamingResponse(
                 _stream_chat(
                     database,
                     cfg,
@@ -243,8 +322,34 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
         try:
-            data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport, clients=request.app.state.http_clients)
+            data, provider_name, usage = await _complete_with_disconnect(
+                request,
+                providers,
+                upstream_payload,
+                cfg.settings.provider_timeout_seconds,
+                request.app.state.http_transport,
+                request.app.state.http_clients,
+            )
             data["model"] = payload.model
+        except _ClientDisconnectedError:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await asyncio.to_thread(
+                        database.log_request,
+                        make_request_log(
+                            client["client_id"],
+                            payload.model,
+                            None,
+                            499,
+                            (time.monotonic() - started) * 1000,
+                            None,
+                            "client_disconnected",
+                            cfg.settings.retention_days,
+                        ),
+                    )
+                except Exception:
+                    logger.warning("Failed to persist client_disconnected request log entry")
+            return _error(499, "Client disconnected.", "invalid_request_error", "client_disconnected")
         except ProviderFailure as failure:
             status = failure.status_code
             try:
@@ -393,7 +498,7 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             error_category = "provider_unavailable"
             final_status = 502
             yield _safe_error_event(error_category)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
         error_category = "client_disconnected"
         final_status = 499
         raise
