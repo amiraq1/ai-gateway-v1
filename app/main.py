@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .auth import authenticate_key, make_request_log
+from .auth import authenticate_key, digest_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
@@ -36,6 +36,12 @@ logger = logging.getLogger("ai_gateway")
 def _check_db_health(database: Database) -> None:
     with database.connect() as conn:
         conn.execute("SELECT 1").fetchone()
+
+
+def _check_gateway_health(database: Database) -> None:
+    _check_db_health(database)
+    pepper = resolve_secret("GATEWAY_PEPPER")
+    digest_key("healthz-check", pepper)
 
 
 class BoundedBodyMiddleware:
@@ -212,6 +218,9 @@ async def _complete_with_disconnect(
 
 def create_app(config: GatewayConfig | None = None, db: Database | None = None) -> FastAPI:
     cfg = config or load_config()
+    if config is None:
+        pepper = resolve_secret("GATEWAY_PEPPER")
+        digest_key("startup-check", pepper)
     database = db or Database(cfg.settings.database_path)
     database.init()
 
@@ -249,7 +258,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         try:
             pepper = await asyncio.to_thread(resolve_secret, "GATEWAY_PEPPER")
-        except SecretLoadError:
+            digest_key("auth-check", pepper)
+        except (SecretLoadError, ValueError):
             return _error(503, "Gateway authentication is unavailable.", "gateway_error", "secret_unavailable")
         client = await asyncio.to_thread(authenticate_key, database, pepper, authorization[7:])
         if not client:
@@ -257,9 +267,9 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         return client
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    async def healthz() -> Any:
         try:
-            await asyncio.to_thread(_check_db_health, database)
+            await asyncio.to_thread(_check_gateway_health, database)
         except Exception:
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return {"status": "ok"}
