@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import yaml
 
@@ -55,6 +54,11 @@ class GatewaySettings:
     provider_timeout_seconds: float
     max_body_bytes: int
     retention_days: int
+    max_stream_bytes: int = 10_485_760
+    stream_idle_timeout_seconds: float = 30.0
+    body_read_timeout_seconds: float = 15.0
+    max_concurrent_requests: int = 32
+    max_client_concurrent_requests: int = 8
 
 
 @dataclass(frozen=True)
@@ -91,10 +95,37 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     timeout = float(os.environ.get("PROVIDER_TIMEOUT_SECONDS", raw_settings.get("provider_timeout_seconds", 45)))
     max_body = int(os.environ.get("MAX_BODY_BYTES", raw_settings.get("max_body_bytes", 1_048_576)))
     retention = int(os.environ.get("LOG_RETENTION_DAYS", raw_settings.get("retention_days", 30)))
-    if not 1 <= port <= 65535 or not 1 <= timeout <= 240 or not 1024 <= max_body <= 10_485_760 or not 1 <= retention <= 365:
+    max_stream = int(os.environ.get("MAX_STREAM_BYTES", raw_settings.get("max_stream_bytes", 10_485_760)))
+    idle_timeout = float(os.environ.get("STREAM_IDLE_TIMEOUT_SECONDS", raw_settings.get("stream_idle_timeout_seconds", 30)))
+    body_timeout = float(os.environ.get("BODY_READ_TIMEOUT_SECONDS", raw_settings.get("body_read_timeout_seconds", 15)))
+    max_concurrent = int(os.environ.get("MAX_CONCURRENT_REQUESTS", raw_settings.get("max_concurrent_requests", 32)))
+    max_client_concurrent = int(os.environ.get("MAX_CLIENT_CONCURRENT_REQUESTS", raw_settings.get("max_client_concurrent_requests", 8)))
+    if (
+        not 1 <= port <= 65535
+        or not 1 <= timeout <= 240
+        or not 1024 <= max_body <= 10_485_760
+        or not 1 <= retention <= 365
+        or not 1024 <= max_stream <= 104_857_600
+        or not 0.1 <= idle_timeout <= 240
+        or not 0.1 <= body_timeout <= 120
+        or not 1 <= max_concurrent <= 1024
+        or not 1 <= max_client_concurrent <= max_concurrent
+    ):
         raise ValueError("Invalid gateway setting range")
     db_path = os.environ.get("GATEWAY_DATABASE_PATH", str(raw_settings.get("database_path", "/tmp/ai-gateway.sqlite3")))
-    settings = GatewaySettings(host, port, db_path, timeout, max_body, retention)
+    settings = GatewaySettings(
+        host,
+        port,
+        db_path,
+        timeout,
+        max_body,
+        retention,
+        max_stream_bytes=max_stream,
+        stream_idle_timeout_seconds=idle_timeout,
+        body_read_timeout_seconds=body_timeout,
+        max_concurrent_requests=max_concurrent,
+        max_client_concurrent_requests=max_client_concurrent,
+    )
 
     raw_models = raw.get("models", {})
     if not isinstance(raw_models, dict):

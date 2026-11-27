@@ -43,6 +43,38 @@ _EXPLICIT_FORBIDDEN_NETWORKS = (
     ipaddress.ip_network("::1/128"),           # RFC 4291 IPv6 Loopback
 )
 
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+_NAT64_LOCAL_USE = ipaddress.ip_network("64:ff9b:1::/48")
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+
+
+def _extract_embedded_ipv4s(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """Extract any IPv4 addresses embedded inside transitional IPv6 mechanisms."""
+    embedded: list[ipaddress.IPv4Address] = []
+    if ip.ipv4_mapped is not None:
+        embedded.append(ip.ipv4_mapped)
+    if ip.sixtofour is not None:
+        embedded.append(ip.sixtofour)
+    if ip.teredo is not None:
+        embedded.extend(ip.teredo)
+
+    val = int(ip)
+    if ip in _IPV4_COMPATIBLE and val > 1:
+        embedded.append(ipaddress.IPv4Address(val & 0xFFFFFFFF))
+    if ip in _NAT64_WELL_KNOWN:
+        embedded.append(ipaddress.IPv4Address(val & 0xFFFFFFFF))
+    elif ip in _NAT64_LOCAL_USE:
+        # RFC 6052 prefix lengths (/96, /64, /56, /48) with u-octet at bits 64..71 == 0
+        if ((val >> 32) & 0xFFFFFFFFFFFF) == 0:
+            embedded.append(ipaddress.IPv4Address(val & 0xFFFFFFFF))
+        elif ((val >> 56) & 0xFFFFFF) == 0 and (val & 0xFFFFFF) == 0:
+            embedded.append(ipaddress.IPv4Address((val >> 24) & 0xFFFFFFFF))
+        elif ((val >> 72) & 0xFF) == 0 and ((val >> 56) & 0xFF) == 0 and (val & 0xFFFFFFFF) == 0:
+            embedded.append(ipaddress.IPv4Address((((val >> 64) & 0xFF) << 24) | ((val >> 32) & 0xFFFFFF)))
+        elif ((val >> 56) & 0xFF) == 0 and (val & 0xFFFFFFFFFF) == 0:
+            embedded.append(ipaddress.IPv4Address((((val >> 64) & 0xFFFF) << 16) | ((val >> 40) & 0xFFFF)))
+    return embedded
+
 
 def is_ip_forbidden(ip_obj_or_str: ipaddress.IPv4Address | ipaddress.IPv6Address | str,
                     allow_private_hosts: bool = False) -> bool:
@@ -63,8 +95,12 @@ def is_ip_forbidden(ip_obj_or_str: ipaddress.IPv4Address | ipaddress.IPv6Address
                 cleaned = cleaned[1:-1]
             ip = ipaddress.ip_address(cleaned)
 
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
+        if isinstance(ip, ipaddress.IPv6Address):
+            for embedded_v4 in _extract_embedded_ipv4s(ip):
+                if is_ip_forbidden(embedded_v4, allow_private_hosts=allow_private_hosts):
+                    return True
+            if ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
 
         # Unconditionally forbidden networks (Cloud Metadata, CGNAT, Multicast, etc.)
         for net in _ALWAYS_FORBIDDEN_NETWORKS:
@@ -121,7 +157,9 @@ def validate_ssrf_url(url: str, provider_name: str = "provider", allow_private_h
     if "%" in raw_host or "%" in url:
         raise ValueError(f"Provider {provider_name!r} api_base contains forbidden zone identifier")
 
-    host_lower = raw_host.lower()
+    host_lower = raw_host.lower().rstrip(".")
+    if not host_lower:
+        raise ValueError(f"Provider {provider_name!r} api_base has no valid hostname")
 
     if not allow_private_hosts:
         forbidden_suffixes = (".localhost", ".local", ".internal", ".lan", ".home", ".corp")

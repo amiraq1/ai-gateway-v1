@@ -23,6 +23,8 @@ build/
 !docker-compose.yml
 !compose.yaml
 !scripts/**
+!.github/
+!.github/**
 
 # Credentials, key material, and certificates
 secrets/

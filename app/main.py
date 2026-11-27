@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
+import logging
 import time
 from typing import Any, Callable
 
+import anyio
 import httpx
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
@@ -14,16 +17,33 @@ from .auth import authenticate_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
-from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, _headers, complete
+from .providers import (
+    MAX_ATTEMPTS,
+    RETRYABLE_STATUS,
+    ProviderFailure,
+    SharedHttpClients,
+    _headers,
+    borrow_http_client,
+    complete,
+    drain_bounded_response,
+)
 from .secret_loader import SecretLoadError, resolve_secret
 from .ssrf import create_safe_transport
+
+logger = logging.getLogger("ai_gateway")
+
+
+def _check_db_health(database: Database) -> None:
+    with database.connect() as conn:
+        conn.execute("SELECT 1").fetchone()
 
 
 class BoundedBodyMiddleware:
     """Buffer only a small, bounded request body before JSON parsing."""
-    def __init__(self, app: Any, maximum: int) -> None:
+    def __init__(self, app: Any, maximum: int, body_timeout: float = 15.0) -> None:
         self.app = app
         self.maximum = maximum
+        self.body_timeout = body_timeout
 
     async def __call__(self, scope: dict[str, Any], receive: Callable, send: Callable) -> None:
         if scope.get("type") != "http":
@@ -31,8 +51,25 @@ class BoundedBodyMiddleware:
             return
         body = bytearray()
         disconnected = False
+        deadline = time.monotonic() + self.body_timeout
         while True:
-            message = await receive()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                response = JSONResponse(
+                    status_code=408,
+                    content={"error": {"message": "Request body read timed out.", "type": "invalid_request_error", "code": "request_timeout"}},
+                )
+                await response(scope, receive, send)
+                return
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except asyncio.TimeoutError:
+                response = JSONResponse(
+                    status_code=408,
+                    content={"error": {"message": "Request body read timed out.", "type": "invalid_request_error", "code": "request_timeout"}},
+                )
+                await response(scope, receive, send)
+                return
             if message["type"] == "http.disconnect":
                 disconnected = True
                 break
@@ -79,11 +116,106 @@ def _parse_sse_data(lines: list[str]) -> str | None:
     return "\n".join(data_lines) if data_lines else None
 
 
+class DisconnectAwareStreamingResponse(StreamingResponse):
+    """StreamingResponse that cancels upstream work on http.disconnect across all ASGI versions."""
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await super().__call__(scope, receive, send)
+            return
+        async with anyio.create_task_group() as tg:
+            async def run_stream() -> None:
+                try:
+                    await self.stream_response(send)
+                except OSError:
+                    pass
+                finally:
+                    aclose = getattr(self.body_iterator, "aclose", None)
+                    if callable(aclose):
+                        with anyio.CancelScope(shield=True):
+                            await aclose()
+                    tg.cancel_scope.cancel()
+
+            async def watch_disconnect() -> None:
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        tg.cancel_scope.cancel()
+                        break
+
+            tg.start_soon(run_stream)
+            await watch_disconnect()
+        if self.background is not None:
+            await self.background()
+
+
+class _ClientDisconnectedError(Exception):
+    """Raised when an HTTP client disconnects while awaiting a non-streaming completion."""
+
+
+async def _complete_with_disconnect(
+    request: Request,
+    providers: list[ProviderConfig],
+    upstream_payload: dict[str, Any],
+    timeout: float,
+    transport: Any,
+    clients: SharedHttpClients,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+    result: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
+    captured_exc: Exception | None = None
+    disconnected = False
+
+    async with anyio.create_task_group() as tg:
+        async def run_complete() -> None:
+            nonlocal result, captured_exc
+            try:
+                result = await complete(
+                    providers,
+                    upstream_payload,
+                    timeout,
+                    transport,
+                    clients=clients,
+                )
+            except Exception as exc:
+                captured_exc = exc
+            finally:
+                tg.cancel_scope.cancel()
+
+        async def watch_disconnect() -> None:
+            nonlocal disconnected
+            while True:
+                message = await request.receive()
+                if message["type"] == "http.disconnect":
+                    disconnected = True
+                    tg.cancel_scope.cancel()
+                    return
+
+        tg.start_soon(watch_disconnect)
+        await run_complete()
+
+    if disconnected:
+        raise _ClientDisconnectedError()
+    if captured_exc is not None:
+        raise captured_exc
+    if result is None:
+        raise _ClientDisconnectedError()
+    return result
+
+
 def create_app(config: GatewayConfig | None = None, db: Database | None = None) -> FastAPI:
     cfg = config or load_config()
     database = db or Database(cfg.settings.database_path)
     database.init()
-    app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @asynccontextmanager
+    async def lifespan(fastapi_app: FastAPI):
+        fastapi_app.state.http_clients.ensure_initialized()
+        try:
+            yield
+        finally:
+            await fastapi_app.state.http_clients.aclose()
+
+    app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway_config = cfg
     app.state.database = database
     app.state.http_transports = {
@@ -91,7 +223,14 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         True: create_safe_transport(allow_private_hosts=True),
     }
     app.state.http_transport = app.state.http_transports
-    app.add_middleware(BoundedBodyMiddleware, maximum=cfg.settings.max_body_bytes)
+    app.state.http_clients = SharedHttpClients(app.state.http_transports, cfg.settings.provider_timeout_seconds)
+    app.state.global_semaphore = asyncio.Semaphore(cfg.settings.max_concurrent_requests)
+    app.state.client_semaphores = {}
+    app.add_middleware(
+        BoundedBodyMiddleware,
+        maximum=cfg.settings.max_body_bytes,
+        body_timeout=cfg.settings.body_read_timeout_seconds,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -101,10 +240,10 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         if not authorization or not authorization.startswith("Bearer "):
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         try:
-            pepper = resolve_secret("GATEWAY_PEPPER")
+            pepper = await asyncio.to_thread(resolve_secret, "GATEWAY_PEPPER")
         except SecretLoadError:
             return _error(503, "Gateway authentication is unavailable.", "gateway_error", "secret_unavailable")
-        client = authenticate_key(database, pepper, authorization[7:])
+        client = await asyncio.to_thread(authenticate_key, database, pepper, authorization[7:])
         if not client:
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         return client
@@ -112,8 +251,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         try:
-            with database.connect() as conn:
-                conn.execute("SELECT 1").fetchone()
+            await asyncio.to_thread(_check_db_health, database)
         except Exception:
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return {"status": "ok"}
@@ -129,7 +267,7 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     async def chat_completions(payload: ChatCompletionRequest, request: Request, client: dict[str, Any] | JSONResponse = Depends(get_client)) -> Any:
         if isinstance(client, JSONResponse):
             return client
-        allowed, retry_after = database.consume_rate_limit(client["client_id"], int(client["rpm"]))
+        allowed, retry_after = await asyncio.to_thread(database.consume_rate_limit, client["client_id"], int(client["rpm"]))
         if not allowed:
             return _error(429, "Rate limit exceeded.", "rate_limit_error", "rate_limit_exceeded", {"Retry-After": str(retry_after)})
         providers = cfg.providers_for(payload.model)
@@ -139,38 +277,115 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             upstream_payload = provider_payload(payload, payload.model)
         except ValueError as exc:
             return _error(400, str(exc), "invalid_request_error", "unsupported_parameter")
+
+        global_sem: asyncio.Semaphore = request.app.state.global_semaphore
+        try:
+            await asyncio.wait_for(global_sem.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            return _error(503, "Gateway concurrency limit exceeded.", "gateway_error", "server_busy", {"Retry-After": "1"})
+
+        client_semaphores: dict[str, asyncio.Semaphore] = request.app.state.client_semaphores
+        client_sem = client_semaphores.setdefault(
+            client["client_id"],
+            asyncio.Semaphore(cfg.settings.max_client_concurrent_requests),
+        )
+        try:
+            await asyncio.wait_for(client_sem.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            global_sem.release()
+            return _error(
+                429,
+                "Too many concurrent requests for this API key.",
+                "rate_limit_error",
+                "too_many_concurrent_requests",
+                {"Retry-After": "1"},
+            )
+
+        released = False
+
+        def release_slots() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                client_sem.release()
+                global_sem.release()
+
         started = time.monotonic()
         if payload.stream:
-            return StreamingResponse(
-                _stream_chat(database, cfg, client, payload.model, providers, upstream_payload, request.app.state.http_transport, started),
+            return DisconnectAwareStreamingResponse(
+                _stream_chat(
+                    database,
+                    cfg,
+                    client,
+                    payload.model,
+                    providers,
+                    upstream_payload,
+                    request.app.state.http_transport,
+                    started,
+                    clients=request.app.state.http_clients,
+                    release_slots=release_slots,
+                ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
         try:
-            data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport)
+            data, provider_name, usage = await _complete_with_disconnect(
+                request,
+                providers,
+                upstream_payload,
+                cfg.settings.provider_timeout_seconds,
+                request.app.state.http_transport,
+                request.app.state.http_clients,
+            )
             data["model"] = payload.model
-            database.log_request(make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
-            return data
+        except _ClientDisconnectedError:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await asyncio.to_thread(
+                        database.log_request,
+                        make_request_log(
+                            client["client_id"],
+                            payload.model,
+                            None,
+                            499,
+                            (time.monotonic() - started) * 1000,
+                            None,
+                            "client_disconnected",
+                            cfg.settings.retention_days,
+                        ),
+                    )
+                except Exception:
+                    logger.warning("Failed to persist client_disconnected request log entry")
+            return _error(499, "Client disconnected.", "invalid_request_error", "client_disconnected")
         except ProviderFailure as failure:
             status = failure.status_code
             try:
-                database.log_request(make_request_log(client["client_id"], payload.model, None, status, (time.monotonic() - started) * 1000, None, failure.category, cfg.settings.retention_days))
+                await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, None, status, (time.monotonic() - started) * 1000, None, failure.category, cfg.settings.retention_days))
             except Exception:
                 return _error(503, "Gateway storage is unavailable.", "gateway_error", "storage_unavailable")
             return _error(status, "The upstream provider could not complete the request.", "gateway_error", failure.category)
         except Exception:
             try:
-                database.log_request(make_request_log(client["client_id"], payload.model, None, 502, (time.monotonic() - started) * 1000, None, "gateway_internal", cfg.settings.retention_days))
+                await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, None, 502, (time.monotonic() - started) * 1000, None, "gateway_internal", cfg.settings.retention_days))
             except Exception:
-                pass
+                logger.warning("Failed to persist error request log entry")
             return _error(502, "The gateway could not complete the request.", "gateway_error", "gateway_internal")
+        finally:
+            release_slots()
+        try:
+            await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
+        except Exception:
+            logger.warning("Failed to persist successful request log entry")
+        return data
 
     return app
 
 
 async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str, Any], alias: str,
                        providers: list[ProviderConfig], base_payload: dict[str, Any],
-                       transport: httpx.AsyncBaseTransport | None, started: float):
+                       transport: httpx.AsyncBaseTransport | None, started: float,
+                       clients: SharedHttpClients | None = None,
+                       release_slots: Callable[[], None] | None = None):
     stream_deadline = started + min(600.0, cfg.settings.provider_timeout_seconds * 10)
     final_provider: str | None = None
     error_category: str | None = None
@@ -183,17 +398,13 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             emitted = False
             event_lines: list[str] = []
             event_size = 0
+            total_stream_bytes = 0
             saw_done = False
-            provider_transport = transport
-            if isinstance(transport, dict):
-                provider_transport = transport.get(provider.allow_private_hosts)
-            elif transport is None:
-                provider_transport = create_safe_transport(allow_private_hosts=provider.allow_private_hosts)
             try:
-                async with httpx.AsyncClient(timeout=cfg.settings.provider_timeout_seconds, transport=provider_transport, follow_redirects=False) as http:
-                    async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider)) as response:
+                async with borrow_http_client(provider, cfg.settings.provider_timeout_seconds, transport=transport, clients=clients) as http:
+                    async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider), timeout=cfg.settings.provider_timeout_seconds) as response:
                         if response.status_code in RETRYABLE_STATUS:
-                            await response.aread()
+                            await drain_bounded_response(response)
                             if index + 1 < len(attempt_providers):
                                 continue
                             error_category = "provider_unavailable"
@@ -216,9 +427,27 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                             final_status = 502
                             yield _safe_error_event(error_category)
                             return
-                        async for line in response.aiter_lines():
-                            if time.monotonic() > stream_deadline:
+                        lines_iter = response.aiter_lines().__aiter__()
+                        received_first_line = False
+                        while True:
+                            remaining_deadline = stream_deadline - time.monotonic()
+                            if remaining_deadline <= 0:
                                 raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted)
+                            step_timeout = (
+                                cfg.settings.provider_timeout_seconds
+                                if not received_first_line
+                                else cfg.settings.stream_idle_timeout_seconds
+                            )
+                            try:
+                                line = await asyncio.wait_for(
+                                    lines_iter.__anext__(),
+                                    timeout=min(remaining_deadline, step_timeout),
+                                )
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                raise ProviderFailure("provider_stream_timeout", 504, retryable=not emitted) from None
+                            received_first_line = True
                             if line == "":
                                 if event_lines:
                                     data = _parse_sse_data(event_lines)
@@ -239,21 +468,26 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                     event_size = 0
                                     if event:
                                         yield event
-                                        emitted = True
+                                        if data is not None:
+                                            emitted = True
                                 continue
-                            event_size += len(line.encode("utf-8"))
+                            line_bytes = len(line.encode("utf-8"))
+                            event_size += line_bytes
+                            total_stream_bytes += line_bytes + 1
+                            if total_stream_bytes > cfg.settings.max_stream_bytes:
+                                raise ProviderFailure("provider_stream_too_large", 502, False)
                             if event_size > 65536:
                                 raise ProviderFailure("provider_event_too_large", 502, False)
                             event_lines.append(line)
                         if event_lines and not saw_done:
                             # An unterminated final SSE event is malformed; never forward a partial event.
-                            raise ProviderFailure("provider_malformed_stream", 502, False)
+                            raise ProviderFailure("provider_malformed_stream", 502, retryable=not emitted)
                         if not saw_done:
-                            yield b"data: [DONE]\n\n"
+                            raise ProviderFailure("provider_incomplete_stream", 502, retryable=not emitted)
                         final_provider = provider.name
                         success = True
                         break
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
+            except (httpx.TransportError, httpx.DecodingError):
                 if not emitted and index + 1 < len(attempt_providers):
                     continue
                 error_category = "provider_stream_failure"
@@ -271,15 +505,28 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
             error_category = "provider_unavailable"
             final_status = 502
             yield _safe_error_event(error_category)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
         error_category = "client_disconnected"
         final_status = 499
         raise
     finally:
-        try:
-            database.log_request(make_request_log(client["client_id"], alias, final_provider, final_status,
-                                                  (time.monotonic() - started) * 1000, usage,
-                                                  error_category, cfg.settings.retention_days))
-        except Exception:
-            # Never place prompts, provider bodies, or exception strings in logs.
-            pass
+        if release_slots is not None:
+            release_slots()
+        with anyio.CancelScope(shield=True):
+            try:
+                await asyncio.to_thread(
+                    database.log_request,
+                    make_request_log(
+                        client["client_id"],
+                        alias,
+                        final_provider,
+                        final_status,
+                        (time.monotonic() - started) * 1000,
+                        usage,
+                        error_category,
+                        cfg.settings.retention_days,
+                    ),
+                )
+            except Exception:
+                # Never place prompts, provider bodies, or exception strings in logs.
+                logger.warning("Failed to persist stream request log entry")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,24 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_client ON request_logs(client_id, ti
 }
 
 
+def _iter_sql_statements(script: str) -> list[str]:
+    statements: list[str] = []
+    parts = script.split(";")
+    buf = ""
+    for index, part in enumerate(parts):
+        suffix = ";" if index < len(parts) - 1 else ""
+        if buf or part.strip():
+            buf += part + suffix
+        if buf and sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt and stmt != ";":
+                statements.append(stmt)
+            buf = ""
+    if buf.strip():
+        statements.append(buf.strip())
+    return statements
+
+
 class Database:
     def __init__(self, path: str, timeout_seconds: float = 5.0) -> None:
         self.path = path
@@ -65,7 +84,6 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         return conn
 
@@ -74,17 +92,29 @@ class Database:
             return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
     def migrate(self, conn: sqlite3.Connection) -> int:
-        current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        has_tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clients'").fetchone()[0] > 0
-        if current_version == 0 and has_tables:
-            current_version = 1
-            conn.execute("PRAGMA user_version = 1")
+        started_tx = not conn.in_transaction
+        if started_tx:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            has_tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clients'").fetchone()[0] > 0
+            if current_version == 0 and has_tables:
+                current_version = 1
+                conn.execute("PRAGMA user_version = 1")
 
-        for target_version in range(current_version + 1, SCHEMA_VERSION + 1):
-            if target_version in MIGRATIONS:
-                conn.executescript(MIGRATIONS[target_version])
-                conn.execute(f"PRAGMA user_version = {target_version}")
-        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+            for target_version in range(current_version + 1, SCHEMA_VERSION + 1):
+                if target_version in MIGRATIONS:
+                    for stmt in _iter_sql_statements(MIGRATIONS[target_version]):
+                        conn.execute(stmt)
+                    conn.execute(f"PRAGMA user_version = {target_version}")
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if started_tx:
+                conn.commit()
+            return version
+        except Exception:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise
 
     def init(self) -> None:
         if self.path != ":memory:":
@@ -92,6 +122,7 @@ class Database:
             try:
                 Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 with self.connect() as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
                     self.migrate(conn)
                 try:
                     os.chmod(self.path, 0o600)
@@ -151,13 +182,28 @@ class Database:
 
     def log_request(self, entry: dict[str, Any]) -> None:
         retention_days = min(max(int(entry.get("retention_days", 30)), 1), 365)
-        with self.connect() as conn:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("""INSERT INTO request_logs
                 (id,timestamp_utc,client_id,model_alias,provider_name,status_code,latency_ms,
                  input_tokens,output_tokens,total_tokens,error_category)
                 VALUES(:id,:timestamp_utc,:client_id,:model_alias,:provider_name,:status_code,:latency_ms,
                        :input_tokens,:output_tokens,:total_tokens,:error_category)""", entry)
-            conn.execute("DELETE FROM request_logs WHERE timestamp_utc < datetime('now', ?)", (f"-{retention_days} days",))
+            conn.execute(
+                "DELETE FROM request_logs WHERE id IN ("
+                "SELECT id FROM request_logs "
+                "WHERE timestamp_utc < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) "
+                "ORDER BY timestamp_utc ASC LIMIT 1000)",
+                (f"-{retention_days} days",),
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def usage_for_client(self, client_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -171,14 +217,32 @@ class Database:
             return int(clients), int(logs)
 
     def backup_to(self, destination: str) -> None:
-        target = sqlite3.connect(destination)
+        dest_path = Path(destination)
+        dest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{dest_path.name}.",
+            suffix=".tmp",
+            dir=str(dest_path.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
         try:
-            with self.connect() as source:
-                source.backup(target)
-            target.commit()
-        finally:
-            target.close()
-        try:
-            os.chmod(destination, 0o600)
-        except OSError:
-            pass
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            target = sqlite3.connect(str(tmp_path))
+            try:
+                with self.connect() as source:
+                    source.backup(target)
+                target.commit()
+            finally:
+                target.close()
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, dest_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise

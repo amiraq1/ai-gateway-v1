@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "fix/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+
+      - name: Install pinned production and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install pytest-cov bandit flake8
+
+      - name: Run flake8 static checks
+        run: flake8 app tests --select=E9,F63,F7,F82,F401,F811,F841 --show-source --statistics
+
+      - name: Run bandit security scan
+        run: |
+          bandit -r app -lll
+          bandit -r app -ll -s B104,B108
+
+      - name: Run pytest suite with branch coverage (POSIX + API + security)
+        run: pytest --cov=app --cov-branch --cov-report=term-missing -v
