@@ -17,7 +17,16 @@ from .auth import authenticate_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
 from .database import Database
 from .models import ChatCompletionRequest, provider_payload
-from .providers import MAX_ATTEMPTS, RETRYABLE_STATUS, ProviderFailure, SharedHttpClients, _headers, borrow_http_client, complete
+from .providers import (
+    MAX_ATTEMPTS,
+    RETRYABLE_STATUS,
+    ProviderFailure,
+    SharedHttpClients,
+    _headers,
+    borrow_http_client,
+    complete,
+    drain_bounded_response,
+)
 from .secret_loader import SecretLoadError, resolve_secret
 from .ssrf import create_safe_transport
 
@@ -168,8 +177,6 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         try:
             data, provider_name, usage = await complete(providers, upstream_payload, cfg.settings.provider_timeout_seconds, request.app.state.http_transport, clients=request.app.state.http_clients)
             data["model"] = payload.model
-            await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
-            return data
         except ProviderFailure as failure:
             status = failure.status_code
             try:
@@ -183,6 +190,11 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             except Exception:
                 logger.warning("Failed to persist error request log entry")
             return _error(502, "The gateway could not complete the request.", "gateway_error", "gateway_internal")
+        try:
+            await asyncio.to_thread(database.log_request, make_request_log(client["client_id"], payload.model, provider_name, 200, (time.monotonic() - started) * 1000, usage, None, cfg.settings.retention_days))
+        except Exception:
+            logger.warning("Failed to persist successful request log entry")
+        return data
 
     return app
 
@@ -208,7 +220,7 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                 async with borrow_http_client(provider, cfg.settings.provider_timeout_seconds, transport=transport, clients=clients) as http:
                     async with http.stream("POST", f"{provider.api_base.rstrip('/')}/chat/completions", headers=_headers(provider), json=_provider_body(base_payload, provider), timeout=cfg.settings.provider_timeout_seconds) as response:
                         if response.status_code in RETRYABLE_STATUS:
-                            await response.aread()
+                            await drain_bounded_response(response)
                             if index + 1 < len(attempt_providers):
                                 continue
                             error_category = "provider_unavailable"
@@ -254,7 +266,8 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                     event_size = 0
                                     if event:
                                         yield event
-                                        emitted = True
+                                        if data is not None:
+                                            emitted = True
                                 continue
                             event_size += len(line.encode("utf-8"))
                             if event_size > 65536:
@@ -262,13 +275,13 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                             event_lines.append(line)
                         if event_lines and not saw_done:
                             # An unterminated final SSE event is malformed; never forward a partial event.
-                            raise ProviderFailure("provider_malformed_stream", 502, False)
+                            raise ProviderFailure("provider_malformed_stream", 502, retryable=not emitted)
                         if not saw_done:
-                            yield b"data: [DONE]\n\n"
+                            raise ProviderFailure("provider_incomplete_stream", 502, retryable=not emitted)
                         final_provider = provider.name
                         success = True
                         break
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
+            except (httpx.TransportError, httpx.DecodingError):
                 if not emitted and index + 1 < len(attempt_providers):
                     continue
                 error_category = "provider_stream_failure"

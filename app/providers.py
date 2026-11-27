@@ -13,6 +13,19 @@ from .ssrf import create_safe_transport
 RETRYABLE_STATUS = {429, *range(500, 600)}
 MAX_ATTEMPTS = 2
 MAX_PROVIDER_RESPONSE_BYTES = 10 * 1024 * 1024
+MAX_ERROR_DRAIN_BYTES = 64 * 1024
+
+
+async def drain_bounded_response(response: httpx.Response, max_bytes: int = MAX_ERROR_DRAIN_BYTES) -> None:
+    """Drain at most max_bytes from an error response before closing it."""
+    drained = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            drained += len(chunk)
+            if drained >= max_bytes:
+                break
+    except (httpx.TransportError, httpx.DecodingError):
+        return
 
 
 def _resolve_transport(
@@ -134,7 +147,7 @@ async def complete(providers: list[ProviderConfig], payload: dict[str, Any], tim
             async with borrow_http_client(provider, timeout, transport=transport, clients=clients) as client:
                 async with client.stream("POST", _url(provider), headers=_headers(provider), json=body, timeout=timeout) as response:
                     if response.status_code in RETRYABLE_STATUS:
-                        await response.aread()
+                        await drain_bounded_response(response)
                         last = ProviderFailure("provider_unavailable", 502, True)
                         if index + 1 < min(len(providers), MAX_ATTEMPTS):
                             continue
@@ -160,8 +173,9 @@ async def complete(providers: list[ProviderConfig], payload: dict[str, Any], tim
             if not isinstance(data, dict) or not isinstance(data.get("choices"), list):
                 raise ProviderFailure("provider_malformed_response", 502, False)
             return data, provider.name, _extract_usage(data)
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
-            last = ProviderFailure("provider_connection", 504, True)
+        except (httpx.TransportError, httpx.DecodingError) as exc:
+            status = 504 if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)) else 502
+            last = ProviderFailure("provider_connection", status, True)
             if index + 1 < min(len(providers), MAX_ATTEMPTS):
                 continue
             raise last from None
