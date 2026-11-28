@@ -27,6 +27,8 @@ def main() -> int:
     backup = sub.add_parser("backup")
     backup.add_argument("destination")
     args = parser.parse_args()
+    if args.command == "create-key" and not 1 <= args.rpm <= 1_000_000:
+        parser.error("--rpm must be between 1 and 1000000")
     config = load_config()
     pepper: str | None = None
     if args.command == "create-key":
