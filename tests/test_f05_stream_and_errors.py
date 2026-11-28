@@ -136,7 +136,7 @@ class SimpleAsyncStream(httpx.AsyncByteStream):
         return None
 
 
-def test_sse_comment_only_does_not_block_fallback(gateway):
+def test_sse_comment_only_blocks_fallback_after_first_byte(gateway):
     app, db = gateway
     seen = []
 
@@ -160,8 +160,10 @@ def test_sse_comment_only_does_not_block_fallback(gateway):
             json={"model": "fast", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
         )
 
-    assert seen == ["primary.example", "secondary.example"]
-    assert "data: [DONE]" in resp.text
+    # Once any upstream byte (including a comment) is forwarded, fallback is forbidden.
+    assert seen == ["primary.example"]
+    assert "event: error" in resp.text
+    assert "data: [DONE]" not in resp.text
 
 
 def test_log_request_failure_does_not_turn_200_into_502(gateway, monkeypatch):

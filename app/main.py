@@ -12,6 +12,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import authenticate_key, digest_key, make_request_log
 from .config import GatewayConfig, ProviderConfig, load_config
@@ -232,7 +233,8 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
         finally:
             await fastapi_app.state.http_clients.aclose()
 
-    app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app = FastAPI(title="AI Gateway V1", docs_url=None, redoc_url=None, openapi_url=None,
+                  lifespan=lifespan, redirect_slashes=False)
     app.state.gateway_config = cfg
     app.state.database = database
     pool_max_connections = max(64, cfg.settings.max_concurrent_requests)
@@ -254,6 +256,11 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         return _error(422, "Request validation failed.", "invalid_request_error", "invalid_request")
 
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        return _error(exc.status_code, "The requested endpoint or method is not available.",
+                      "invalid_request_error", "http_error")
+
     async def get_client(authorization: str | None = Header(default=None)) -> dict[str, Any] | JSONResponse:
         if not authorization or not authorization.startswith("Bearer "):
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
@@ -262,7 +269,10 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
             digest_key("auth-check", pepper)
         except (SecretLoadError, ValueError):
             return _error(503, "Gateway authentication is unavailable.", "gateway_error", "secret_unavailable")
-        client = await asyncio.to_thread(authenticate_key, database, pepper, authorization[7:])
+        try:
+            client = await asyncio.to_thread(authenticate_key, database, pepper, authorization[7:])
+        except Exception:
+            return _error(503, "Gateway storage is unavailable.", "gateway_error", "storage_unavailable")
         if not client:
             return _error(401, "A valid bearer API key is required.", "authentication_error", "invalid_api_key", {"WWW-Authenticate": "Bearer"})
         return client
@@ -286,7 +296,10 @@ def create_app(config: GatewayConfig | None = None, db: Database | None = None) 
     async def chat_completions(payload: ChatCompletionRequest, request: Request, client: dict[str, Any] | JSONResponse = Depends(get_client)) -> Any:
         if isinstance(client, JSONResponse):
             return client
-        allowed, retry_after = await asyncio.to_thread(database.consume_rate_limit, client["client_id"], int(client["rpm"]))
+        try:
+            allowed, retry_after = await asyncio.to_thread(database.consume_rate_limit, client["client_id"], int(client["rpm"]))
+        except Exception:
+            return _error(503, "Gateway storage is unavailable.", "gateway_error", "storage_unavailable")
         if not allowed:
             return _error(429, "Rate limit exceeded.", "rate_limit_error", "rate_limit_exceeded", {"Retry-After": str(retry_after)})
         providers = cfg.providers_for(payload.model)
@@ -505,8 +518,8 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                     data = _parse_sse_data(event_lines)
                                     if data is not None:
                                         if data == "[DONE]":
-                                            yield ("\n".join(event_lines) + "\n\n").encode("utf-8")
                                             emitted = True
+                                            yield ("\n".join(event_lines) + "\n\n").encode("utf-8")
                                             saw_done = True
                                             break
                                         try:
@@ -519,9 +532,8 @@ async def _stream_chat(database: Database, cfg: GatewayConfig, client: dict[str,
                                     event_lines = []
                                     event_size = 0
                                     if event:
+                                        emitted = True
                                         yield event
-                                        if data is not None:
-                                            emitted = True
                                 continue
                             event_size += len(line.encode("utf-8"))
                             if event_size > 65536:

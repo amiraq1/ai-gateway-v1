@@ -19,6 +19,8 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
     logit_bias: dict[str, float] | None = None
     user: str | None = Field(default=None, max_length=256)
     seed: int | None = None
